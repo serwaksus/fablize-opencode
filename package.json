@@ -1,0 +1,8 @@
+{
+  "name": "fablize-opencode",
+  "version": "1.0.0",
+  "description": "Enforced execution discipline plugin for opencode — verification grounding, evidence ledger, early-stop prevention. Ported from fivetaku/fablize (Claude Code).",
+  "type": "module",
+  "main": "dist/index.js",
+  "license": "MIT"
+}
