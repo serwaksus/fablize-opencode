@@ -86,19 +86,23 @@ function detectUnsupportedClaim(text) {
   return null;
 }
 
-// ══ P0-2: VERIFICATION COMMAND CLASSIFICATION ══
-function isVerificationCommand(title) {
-  var t = (title || "").toLowerCase();
-  // Known test/lint/build/typecheck commands
-  if (/\b(npm|pnpm|yarn)\s+(test|run\s+(test|lint|typecheck|build|check))\b/.test(t)) return true;
-  if (/\b(pytest|python\s+-m\s+pytest|python3?\s+-m\s+pytest)\b/.test(t)) return true;
-  if (/\b(ruff|mypy|pyright|flake8|pylint|bandit)\b/.test(t)) return true;
-  if (/\btsc(\s|$|--)/.test(t)) return true;
-  if (/\b(go|cargo|gradle\w*|mvn|make)\s+(test|vet|clippy|check|build)\b/.test(t)) return true;
+// ══ P0: VERIFICATION COMMAND CLASSIFICATION (uses command, not title) ══
+function extractCommand(args) {
+  if (!args) return "";
+  return String(args.command || args.cmd || args.script || "").trim();
+}
+
+function isVerificationCommand(command) {
+  var c = (command || "").toLowerCase();
+  if (!c) return false;
+  if (/\b(npm|pnpm|yarn)\s+(test|run\s+(test|lint|check|typecheck|build))\b/.test(c)) return true;
+  if (/\b(pytest|python\s+-m\s+pytest|python3?\s+-m\s+pytest)\b/.test(c)) return true;
+  if (/\b(ruff|mypy|pyright|flake8|pylint|bandit)\b/.test(c)) return true;
+  if (/\btsc(\s|$|--)/.test(c)) return true;
+  if (/\b(go|cargo|gradle\w*|mvn|make)\s+(test|vet|clippy|check|build)\b/.test(c)) return true;
   // Python execution for financial verification (Rule 6)
-  if (/python/.test(t) && /\b(print|sum|calc|audit|verify|check|test|range|len)\b/.test(t)) return true;
-  // Generic patterns in title
-  if (/\b(run\s+)?(test|lint|check|verify|typecheck|build)\b/.test(t)) return true;
+  if (/python/.test(c) && /\b(print|sum|calc|audit|verify|check|test|range|len)\b/.test(c)) return true;
+  if (/\b(run\s+)?(test|lint|check|verify|typecheck|build)\b/.test(c)) return true;
   return false;
 }
 
@@ -276,6 +280,7 @@ function getLedgerSummary(sessionID) {
   for (var i = 0; i < recent.length; i++) {
     var e = recent[i];
     var line = (startIdx + i + 1) + ". [" + e.tool + "] " + e.title;
+    if (e.command) line += " — " + e.command.substring(0, 80);
     if (e.exitCode !== null && e.exitCode !== undefined) line += " → exit " + e.exitCode;
     if (e.testResult) line += ", " + e.testResult;
     if (e.filePath) line += " → " + e.filePath;
@@ -314,6 +319,7 @@ var fablizePlugin = async function (_input) {
 
       if (!state.fullPromptInjected) {
         state.fullPromptInjected = true;
+        state.previousTaskMode = state.currentTaskMode;
         parts.push(DISCIPLINE_PROMPT);
         var tp = getTaskPrompt(state.currentTaskMode);
         if (tp) parts.push("\n" + tp);
@@ -321,12 +327,12 @@ var fablizePlugin = async function (_input) {
       } else {
         parts.push(DISCIPLINE_SHORT);
         if (state.currentTaskMode !== state.previousTaskMode) {
+          state.previousTaskMode = state.currentTaskMode;
           var newTp = getTaskPrompt(state.currentTaskMode);
           if (newTp) parts.push("\n" + newTp);
           if (needsFinancialRules(state.currentTaskMode)) parts.push("\n" + FINANCIAL_RULES);
         }
       }
-      state.previousTaskMode = state.currentTaskMode;
 
       if (state.pendingCompletionBlock) {
         parts.push("\n--- " + state.pendingCompletionBlock + " ---\n");
@@ -371,19 +377,24 @@ var fablizePlugin = async function (_input) {
       var mode = detectTaskMode(msgText);
       if (sessionID) stateOf(sessionID).currentTaskMode = mode;
 
+      // P1-b/c: Only set params if not already specified; use 'high' for non-critical modes
       var tempMap = {
-        "creative":{temp:0.7,effort:"high"},"audit":{temp:0.1,effort:"max"},
-        "debug":{temp:0.3,effort:"max"},"coding":{temp:0.2,effort:"max"},
-        "create":{temp:0.3,effort:"max"},
-        "financial_verify":{temp:0.1,effort:"max"},"financial_analyze":{temp:0.4,effort:"max"},
-        "financial_hypothesis":{temp:0.6,effort:"max"},"financial_general":{temp:0.2,effort:"max"},
-        "default":{temp:0.3,effort:"max"}
+        "creative":{temp:0.7,effort:"high"},
+        "audit":{temp:0.1,effort:"max"},
+        "debug":{temp:0.2,effort:"max"},
+        "coding":{temp:0.2,effort:"high"},
+        "create":{temp:0.3,effort:"high"},
+        "financial_verify":{temp:0.1,effort:"max"},
+        "financial_analyze":{temp:0.4,effort:"max"},
+        "financial_hypothesis":{temp:0.6,effort:"high"},
+        "financial_general":{temp:0.2,effort:"max"},
+        "default":{temp:0.3,effort:"high"}
       };
       var settings = tempMap[mode] || tempMap["default"];
-      output.temperature = settings.temp;
+      if (output.temperature == null) output.temperature = settings.temp;
       output.options = output.options || {};
-      output.options.reasoning_effort = settings.effort;
-      if (!output.maxOutputTokens || output.maxOutputTokens < 8192) output.maxOutputTokens = 8192;
+      if (output.options.reasoning_effort == null) output.options.reasoning_effort = settings.effort;
+      if (!output.maxOutputTokens || output.maxOutputTokens < 4096) output.maxOutputTokens = 8192;
     },
 
     "experimental.chat.messages.transform": async function (_input, msgOutput) {
@@ -398,7 +409,10 @@ var fablizePlugin = async function (_input) {
             break;
           }
         }
-        if (!sessionID) return; // Can't safely determine session — skip check
+        if (!sessionID) {
+          if (process.env.FABLIZE_DEBUG === "1") console.error("[fablize] completion check skipped: sessionID unavailable");
+          return;
+        }
 
         var state = stateOf(sessionID);
         state.pendingWarning = null;
@@ -441,18 +455,20 @@ var fablizePlugin = async function (_input) {
       var exitCode = extractExitCode(outStr, metadata);
       var errorFlag = hasError(outStr, exitCode);
       var title = (output && output.title) ? output.title : "(" + input.tool + ")";
+      var command = extractCommand(input.args);
 
       recordEvidence(sessionID, {
         tool: input.tool,
         callID: input.callID,
         title: title,
+        command: command,
         timestamp: Date.now(),
         keyNumbers: extractKeyNumbers(outStr),
         hasError: errorFlag,
         exitCode: exitCode,
         testResult: extractTestResult(outStr),
         filePath: extractFilePath(input.args),
-        isVerification: input.tool === "bash" ? isVerificationCommand(title) : false,
+        isVerification: input.tool === "bash" ? isVerificationCommand(command) : false,
       });
 
       if (errorFlag) {
