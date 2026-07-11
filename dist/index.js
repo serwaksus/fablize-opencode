@@ -653,6 +653,83 @@ var fablizePlugin = async function (_input) {
       }
     },
 
+    // ══ #5: COMPACTION MEMORY — preserve fablize state across context compression ══
+    "experimental.session.compacting": async function (input, output) {
+      try {
+        var sessionID = input.sessionID;
+        var state = stateOf(sessionID);
+        var ledger = ledgers.get(sessionID) || [];
+        var writeInfo = countWritesInLedger(ledger);
+
+        // Build compact continuation state from session data
+        var lines = ["FABLIZE CONTINUATION STATE"];
+
+        // Task mode + risk
+        lines.push("Task mode: " + state.currentTaskMode);
+        if (state.isRisky) lines.push("Risk: HIGH (migration/auth/money/infra detected)");
+
+        // Implementation contract status
+        if (state.planRequested) {
+          lines.push("Plan contract: " + (state.planProvided ? "provided" : "requested but NOT provided"));
+        }
+
+        // Blind-spot status
+        if (state.blindSpotRequested) {
+          lines.push("Blind-spot pass: " + (state.blindSpotDone ? "completed" : "requested but NOT completed"));
+        }
+
+        // Files changed
+        if (state.writtenFiles && state.writtenFiles.length > 0) {
+          lines.push("Files changed: " + state.writtenFiles.join(", "));
+        }
+
+        // Last verification
+        var lastVerify = null;
+        for (var i = ledger.length - 1; i >= 0; i--) {
+          if (ledger[i].isVerification && ledger[i].exitCode === 0) {
+            lastVerify = ledger[i].command + " → exit " + ledger[i].exitCode;
+            if (ledger[i].testResult) lastVerify += ", " + ledger[i].testResult;
+            break;
+          }
+        }
+        lines.push("Last verification: " + (lastVerify || "none"));
+
+        // Review status
+        if (state.reviewRequested) {
+          var reviewStatus = state.reviewDone ? "completed" :
+            (state.reviewEvidenceSeen ? "evidence seen, awaiting verdict" : "requested, no evidence yet");
+          lines.push("Diff review: " + reviewStatus);
+        }
+
+        // Open errors
+        var openErrors = [];
+        for (var j = ledger.length - 1; j >= 0 && openErrors.length < 3; j--) {
+          if (ledger[j].hasError) openErrors.push(ledger[j].title);
+        }
+        if (openErrors.length > 0) {
+          lines.push("Open errors: " + openErrors.join("; "));
+        }
+
+        // Pending gates
+        if (state.pendingCompletionBlock) lines.push("Pending block: " + state.pendingCompletionBlock.substring(0, 100));
+
+        // Key numbers from recent tool calls
+        var recentNumbers = [];
+        for (var k = ledger.length - 1; k >= 0 && recentNumbers.length < 5; k--) {
+          if (ledger[k].keyNumbers && ledger[k].keyNumbers.length > 0) {
+            recentNumbers = recentNumbers.concat(ledger[k].keyNumbers);
+          }
+        }
+        if (recentNumbers.length > 0) {
+          lines.push("Key numbers: " + recentNumbers.slice(0, 5).join(", "));
+        }
+
+        output.context.push(lines.join("\n"));
+      } catch (e) {
+        // Never crash compaction — fail silently
+      }
+    },
+
   };
 };
 
