@@ -4,10 +4,22 @@ import { readFileSync } from "fs";
 var JOURNAL_PATH = "/root/.config/opencode/agent-journal.md";
 var JOURNAL_MAX_ENTRIES = 5;
 
-// ══ SESSION STATE (isolated per sessionID) ══
+// ══ SESSION STATE (isolated per sessionID, with TTL cleanup) ══
 var sessionState = new Map();
+var SESSION_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+function cleanupSessions() {
+  var now = Date.now();
+  for (var id of sessionState.keys()) {
+    if (now - sessionState.get(id).lastSeenAt > SESSION_TTL_MS) {
+      sessionState.delete(id);
+      ledgers.delete(id);
+    }
+  }
+}
 
 function stateOf(sessionID) {
+  cleanupSessions();
   if (!sessionState.has(sessionID)) {
     sessionState.set(sessionID, {
       currentTaskMode: "default",
@@ -17,9 +29,12 @@ function stateOf(sessionID) {
       pendingCompletionBlock: null,
       fullPromptInjected: false,
       journalInjected: false,
+      lastSeenAt: Date.now(),
     });
   }
-  return sessionState.get(sessionID);
+  var state = sessionState.get(sessionID);
+  state.lastSeenAt = Date.now();
+  return state;
 }
 
 // ══ TASK MODE DETECTION ══
@@ -63,7 +78,7 @@ var FINANCIAL_MODES = ["audit", "financial_verify", "financial_analyze", "financ
 // ══ TASK PROMPTS (P1-6: added coding profile) ══
 var TASK_PROMPTS = {
   "audit": "--- TASK MODE: AUDIT ---\nCheck ALL control sums. Convert тыс→млн EXPLICITLY (÷1000).\nTrace discrepancies to source cells. Compare cross-sheet values.\nALL calculations via Python. State units (R8). Show conversions (R9).",
-  "debug": "--- TASK MODE: DEBUG ---\nReproduce error FIRST: show command + output.\n3+ competing hypotheses. Causal chain: root cause → mechanism → symptom.\nAfter fix: RE-RUN failing case. No 'fixed' without re-run.",
+  "debug": "--- TASK MODE: DEBUG ---\nReproduce error FIRST: show command + output.\n3+ competing hypotheses. Causal chain: root cause → mechanism → symptom.\nKeep diff scoped; do not refactor unrelated code.\nAfter fix: RE-RUN failing case with real verification command (test/lint/typecheck). No 'fixed' without re-run.",
   "coding": "--- TASK MODE: CODING ---\nInspect nearest implementation and its tests before editing.\nKeep diff scoped; do not refactor unrelated code.\nAfter last code edit: run smallest relevant verification (test/lint/typecheck).\nFor bug fixes: show failing scenario, fix, then rerun.\nReport: files changed, verification result, unverified risk.\nDo NOT claim a test passed without showing its output.",
   "create": "--- TASK MODE: CREATE ---\nAfter creating: READ FILE BACK. Confirm content matches intent.\nShow key parts as evidence. Run applicable tests/checks."
 };
@@ -86,23 +101,29 @@ function detectUnsupportedClaim(text) {
   return null;
 }
 
-// ══ P0: VERIFICATION COMMAND CLASSIFICATION (uses command, not title) ══
+// ══ P0: VERIFICATION COMMAND CLASSIFICATION (^ anchored, strict) ══
 function extractCommand(args) {
   if (!args) return "";
   return String(args.command || args.cmd || args.script || "").trim();
 }
 
+var VERIFICATION_PATTERNS = [
+  /^(?:npm|pnpm|yarn)\s+(?:test|run\s+(?:test|lint|check|typecheck|build))\b/,
+  /^(?:python(?:3)?\s+-m\s+pytest|pytest)\b/,
+  /^(?:ruff|mypy|pyright|flake8|pylint|bandit)\b/,
+  /^(?:npx\s+)?(?:tsc|eslint|prettier)\b/,
+  /^(?:go\s+(?:test|vet)|cargo\s+(?:test|check|clippy)|gradlew?\s+test|mvn\s+test)\b/,
+  /^make\s+(?:test|lint|check|build)\b/
+];
+
 function isVerificationCommand(command) {
-  var c = (command || "").toLowerCase();
+  var c = (command || "").trim().toLowerCase();
   if (!c) return false;
-  if (/\b(npm|pnpm|yarn)\s+(test|run\s+(test|lint|check|typecheck|build))\b/.test(c)) return true;
-  if (/\b(pytest|python\s+-m\s+pytest|python3?\s+-m\s+pytest)\b/.test(c)) return true;
-  if (/\b(ruff|mypy|pyright|flake8|pylint|bandit)\b/.test(c)) return true;
-  if (/\btsc(\s|$|--)/.test(c)) return true;
-  if (/\b(go|cargo|gradle\w*|mvn|make)\s+(test|vet|clippy|check|build)\b/.test(c)) return true;
-  // Python execution for financial verification (Rule 6)
-  if (/python/.test(c) && /\b(print|sum|calc|audit|verify|check|test|range|len)\b/.test(c)) return true;
-  if (/\b(run\s+)?(test|lint|check|verify|typecheck|build)\b/.test(c)) return true;
+  for (var i = 0; i < VERIFICATION_PATTERNS.length; i++) {
+    if (VERIFICATION_PATTERNS[i].test(c)) return true;
+  }
+  // Financial verification: python script (not just print)
+  if (/^python/.test(c) && /\.(py|csv|xlsx)/.test(c)) return true;
   return false;
 }
 
@@ -353,15 +374,8 @@ var fablizePlugin = async function (_input) {
         state.pendingJournalSearch = null;
       }
 
-      if (!state.journalInjected) {
-        state.journalInjected = true;
-        var entries = readLastJournalEntries(JOURNAL_MAX_ENTRIES);
-        if (entries) {
-          parts.push("\n<agent-journal — LAST " + JOURNAL_MAX_ENTRIES + " ENTRIES>");
-          parts.push("Lessons from previous sessions. Apply when relevant.\n");
-          parts.push(entries + "</agent-journal>");
-        }
-      }
+      // P2: Journal auto-injection disabled — keep only error-context search
+      // (re-enabled per-project when structured JSONL + projectId available)
 
       parts.push(getLedgerSummary(sessionID));
       output.system.push(parts.join("\n"));
@@ -394,7 +408,7 @@ var fablizePlugin = async function (_input) {
       if (output.temperature == null) output.temperature = settings.temp;
       output.options = output.options || {};
       if (output.options.reasoning_effort == null) output.options.reasoning_effort = settings.effort;
-      if (!output.maxOutputTokens || output.maxOutputTokens < 4096) output.maxOutputTokens = 8192;
+      if (output.maxOutputTokens == null) output.maxOutputTokens = 4096;
     },
 
     "experimental.chat.messages.transform": async function (_input, msgOutput) {
