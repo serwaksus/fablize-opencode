@@ -4,6 +4,10 @@ import { readFileSync } from "fs";
 var JOURNAL_PATH = "/root/.config/opencode/agent-journal.md";
 var JOURNAL_MAX_ENTRIES = 5;
 
+// ══ LEDGER (declared before session state — cleanupSessions depends on it) ══
+var ledgers = new Map();
+var MAX_ENTRIES = 100, RECENT_WINDOW = 10;
+
 // ══ SESSION STATE (isolated per sessionID, with TTL cleanup) ══
 var sessionState = new Map();
 var SESSION_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
@@ -149,17 +153,37 @@ function checkCompletionGate(text, ledger, taskMode) {
   }
   if (lastWriteIdx === -1) return null;
 
-  // P0-2: Require VERIFICATION command (not just any bash with exit 0)
+  // P0-2 + P1: Require VERIFICATION command relevant to the changed file type
+  var changedFile = ledger[lastWriteIdx].filePath || "";
+  var changedExt = changedFile ? changedFile.split(".").pop().toLowerCase() : "";
+
   for (var j = lastWriteIdx + 1; j < ledger.length; j++) {
     var entry = ledger[j];
     if (entry.tool === "bash" && entry.exitCode === 0 && !entry.hasError && entry.isVerification) {
-      return null; // Valid verification found!
+      // Check relevance: verify command should match the changed file type
+      if (isRelevantVerification(entry.command, changedExt)) return null;
     }
   }
   return "COMPLETION BLOCKED: After the last file change (step " + (lastWriteIdx + 1) +
-    ": " + ledger[lastWriteIdx].title + "), there is NO successful VERIFICATION command. " +
-    "Run a real check (test/lint/typecheck/build) or state exactly why it cannot be run. " +
-    "Non-verification commands (echo, pwd, git status) do NOT count.";
+    ": " + ledger[lastWriteIdx].title + "), there is NO relevant verification command. " +
+    "Run a check that matches the changed file type (." + (changedExt || "?") + ") " +
+    "or state exactly why it cannot be run.";
+}
+
+function isRelevantVerification(command, fileExt) {
+  if (!command || !fileExt) return true; // No file type info → accept any verification
+  var c = command.toLowerCase();
+  var pyExts = ["py", "csv", "xlsx", "jsonl"];
+  var tsExts = ["ts", "tsx", "js", "jsx", "mjs"];
+  var goExts = ["go"];
+  var rsExts = ["rs"];
+  if (pyExts.indexOf(fileExt) !== -1 && /(pytest|ruff|mypy|pyright|python)/.test(c)) return true;
+  if (tsExts.indexOf(fileExt) !== -1 && /(npm|pnpm|yarn|tsc|eslint|prettier)/.test(c)) return true;
+  if (goExts.indexOf(fileExt) !== -1 && /go\s+(test|vet)/.test(c)) return true;
+  if (rsExts.indexOf(fileExt) !== -1 && /cargo/.test(c)) return true;
+  // Generic: make or unknown type → accept
+  if (/make\s+/.test(c)) return true;
+  return false;
 }
 
 // ══ EVIDENCE EXTRACTION ══
@@ -279,9 +303,7 @@ var DISCIPLINE_PROMPT = [
 
 var DISCIPLINE_SHORT = "<fablize-active> Verify before done (R1) | Completion auto-gated: write→real verify needed (R2) | 2+ hypotheses (R3) | No unsupported claims (R4) | Journal (R5) | Try 2+ but NOT for destructive ops (R10). Financial rules (R6-R9) in task prompt. </fablize-active>";
 
-// ══ LEDGER ══
-var ledgers = new Map();
-var MAX_ENTRIES = 100, RECENT_WINDOW = 10;
+// ══ LEDGER FUNCTIONS (ledgers + MAX_ENTRIES declared at top of file) ══
 
 function recordEvidence(sessionID, entry) {
   if (!ledgers.has(sessionID)) ledgers.set(sessionID, []);
