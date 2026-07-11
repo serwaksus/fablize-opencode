@@ -459,7 +459,7 @@ var fablizePlugin = async function (_input) {
 
       // #1: BLIND-SPOT GATE — only before risky changes, before any writes
       var ledger = ledgers.get(sessionID) || [];
-      var hasWrites = ledger.length > 0 && ledger.some(function(e) { return e.tool === "write" || e.tool === "edit"; });
+      var hasWrites = ledger.some(function(e) { return e.tool === "write" || e.tool === "edit"; });
       if (state.isRisky && !state.blindSpotRequested && !hasWrites) {
         parts.push("\n" + BLIND_SPOT_PROMPT);
         state.blindSpotRequested = true;
@@ -642,8 +642,8 @@ var fablizePlugin = async function (_input) {
         if (st.planRequested && !st.planProvided) st.planProvided = true;
       }
 
-      // Track diff review evidence
-      if (input.tool === "bash" && isDiffReviewCommand(command)) {
+      // Track diff review evidence (only on success)
+      if (input.tool === "bash" && exitCode === 0 && !errorFlag && isDiffReviewCommand(command)) {
         stateOf(sessionID).reviewEvidenceSeen = true;
       }
 
