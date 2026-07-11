@@ -165,7 +165,7 @@ function hasBlindSpotCompletion(text) {
 }
 
 function isDiffReviewCommand(command) {
-  return /^(?:git\s+diff(?:\s|$)|git\s+status\s+--short\b)/i.test((command || "").trim());
+  return /^git\s+diff(?:\s|$)/i.test((command || "").trim());
 }
 
 // ══ COMPLETION DETECTION ══
@@ -574,8 +574,13 @@ var fablizePlugin = async function (_input) {
 
           // #4: DIFF-AWARE REVIEW — verify evidence before accepting review
           if (state.reviewRequested && !state.reviewDone) {
-            // Wait for review evidence (git diff or review verdict)
-            if (/no actionable finding|diff review|adversarial/i.test(fullText)) {
+            var hasVerdict = /no actionable finding|diff review|adversarial/i.test(fullText);
+            if (hasVerdict && !state.reviewEvidenceSeen) {
+              // Verdict without evidence → block
+              state.pendingCompletionBlock = "DIFF REVIEW EVIDENCE REQUIRED: You stated a review verdict without inspecting the diff. Run `git diff --check` and `git diff`, then report findings with file/line evidence.";
+              break;
+            }
+            if (state.reviewEvidenceSeen && hasVerdict) {
               state.reviewDone = true;
             }
           }
