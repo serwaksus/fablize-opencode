@@ -37,9 +37,11 @@ function stateOf(sessionID) {
       lastSeenAt: Date.now(),
       blindSpotRequested: false,
       blindSpotDone: false,
+      blindSpotBypassed: false,
       isRisky: false,
       planRequested: false,
       planProvided: false,
+      planBypassed: false,
       invariantsInjected: false,
       reviewRequested: false,
       reviewEvidenceSeen: false,
@@ -636,10 +638,10 @@ var fablizePlugin = async function (_input) {
       if ((input.tool === "write" || input.tool === "edit") && filePath) {
         var st = stateOf(sessionID);
         if (st.writtenFiles.indexOf(filePath) === -1) st.writtenFiles.push(filePath);
-        // If blind-spot was requested but not completed, mark it (model proceeded to write)
-        if (st.blindSpotRequested && !st.blindSpotDone) st.blindSpotDone = true;
-        // If plan was requested but not provided, still allow writes (don't hard-block)
-        if (st.planRequested && !st.planProvided) st.planProvided = true;
+        // If blind-spot was requested but not completed, mark as bypassed (not done)
+        if (st.blindSpotRequested && !st.blindSpotDone) st.blindSpotBypassed = true;
+        // If plan was requested but not provided, mark as bypassed
+        if (st.planRequested && !st.planProvided) st.planBypassed = true;
       }
 
       // Track diff review evidence (only on success)
@@ -670,12 +672,16 @@ var fablizePlugin = async function (_input) {
 
         // Implementation contract status
         if (state.planRequested) {
-          lines.push("Plan contract: " + (state.planProvided ? "provided" : "requested but NOT provided"));
+          if (state.planProvided) lines.push("Plan contract: provided");
+          else if (state.planBypassed) lines.push("Plan contract: BYPASSED before first write — assumptions not recorded");
+          else lines.push("Plan contract: requested but not yet provided");
         }
 
         // Blind-spot status
         if (state.blindSpotRequested) {
-          lines.push("Blind-spot pass: " + (state.blindSpotDone ? "completed" : "requested but NOT completed"));
+          if (state.blindSpotDone) lines.push("Blind-spot pass: completed");
+          else if (state.blindSpotBypassed) lines.push("Blind-spot pass: BYPASSED before first write — unknowns not enumerated");
+          else lines.push("Blind-spot pass: requested but not yet completed");
         }
 
         // Files changed
