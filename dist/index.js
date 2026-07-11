@@ -1,12 +1,10 @@
 import { readFileSync, existsSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
 
 // ══ CONFIG ══
 var JOURNAL_PATH = "/root/.config/opencode/agent-journal.md";
 var JOURNAL_MAX_ENTRIES = 5;
-var INVARIANTS_PATHS = [
-  process.cwd() + "/.opencode/fablize-invariants.md",
-  "/root/.opencode/fablize-invariants.md",
-];
 
 // ══ LEDGER (declared before session state) ══
 var ledgers = new Map();
@@ -37,10 +35,14 @@ function stateOf(sessionID) {
       pendingCompletionBlock: null,
       fullPromptInjected: false,
       lastSeenAt: Date.now(),
+      blindSpotRequested: false,
       blindSpotDone: false,
       isRisky: false,
-      planInjected: false,
+      planRequested: false,
+      planProvided: false,
       invariantsInjected: false,
+      reviewRequested: false,
+      reviewEvidenceSeen: false,
       reviewDone: false,
       writtenFiles: [],
     });
@@ -124,6 +126,8 @@ var BLIND_SPOT_PROMPT = [
   "If no material unknowns: write 'No blocking unknowns found' and proceed."
 ].join("\n");
 
+// #4 update: Diff review now requires evidence
+
 // #2: Plan as contract
 var PLAN_CONTRACT_PROMPT = [
   "--- IMPLEMENTATION CONTRACT (before first write) ---",
@@ -148,6 +152,21 @@ var DIFF_REVIEW_PROMPT = [
   "For every finding cite file and line. Do NOT modify code in this pass.",
   "If no issues: state 'No actionable finding after diff review.'"
 ].join("\n");
+
+// ══ CONDITIONAL DETECTION HELPERS ══
+function hasPlanMarkers(text) {
+  if (!text) return false;
+  return /\b(goal|цель)\b/i.test(text) && /\b(in scope|в рамках|acceptance|критер)/i.test(text);
+}
+
+function hasBlindSpotCompletion(text) {
+  if (!text) return false;
+  return /no blocking unknowns/i.test(text) || /\b(unknown|неизвестн|risk|risk|вопрос)\b/i.test(text);
+}
+
+function isDiffReviewCommand(command) {
+  return /^(?:git\s+diff(?:\s|$)|git\s+status\s+--short\b)/i.test((command || "").trim());
+}
 
 // ══ COMPLETION DETECTION ══
 var DONE_PATTERNS = [
@@ -286,13 +305,17 @@ function searchJournal(keywords) {
   } catch (e) { return null; }
 }
 
-// #3: Project invariants
-function readInvariants(taskMode) {
-  for (var p = 0; p < INVARIANTS_PATHS.length; p++) {
-    var path = INVARIANTS_PATHS[p];
-    if (!existsSync(path)) continue;
+// #3: Project invariants — reads from workspace-aware paths
+function readInvariants(taskMode, directory, worktree) {
+  var paths = [
+    join(worktree || directory || ".", ".opencode", "fablize-invariants.md"),
+    join(directory || ".", ".opencode", "fablize-invariants.md"),
+    join(homedir(), ".opencode", "fablize-invariants.md"),
+  ];
+  for (var p = 0; p < paths.length; p++) {
+    if (!existsSync(paths[p])) continue;
     try {
-      var content = readFileSync(path, "utf-8");
+      var content = readFileSync(paths[p], "utf-8");
       var sections = content.split(/^## /m);
       var modeKw = {
         "audit": ["financial","finance","audit","аудит","финанс"],
@@ -384,10 +407,11 @@ function getLedgerSummary(sessionID) {
 }
 
 function countWritesInLedger(ledger) {
+  ledger = ledger || [];
   var count = 0, files = {};
   for (var i = 0; i < ledger.length; i++) {
-    if ((ledger[i].tool === "write" || ledger[i].tool === "edit") && ledger[i].filePath) {
-      files[ledger[i].filePath] = true;
+    if (ledger[i].tool === "write" || ledger[i].tool === "edit") {
+      files[ledger[i].filePath || "_"] = true;
       count++;
     }
   }
@@ -395,6 +419,7 @@ function countWritesInLedger(ledger) {
 }
 
 function hasRiskyFileChange(ledger) {
+  ledger = ledger || [];
   var riskyPatterns = ["migration","schema","auth","permission","api","config",".env","secret","deploy","terraform","sql"];
   for (var i = 0; i < ledger.length; i++) {
     if (ledger[i].filePath) {
@@ -434,21 +459,21 @@ var fablizePlugin = async function (_input) {
 
       // #1: BLIND-SPOT GATE — only before risky changes, before any writes
       var ledger = ledgers.get(sessionID) || [];
-      var hasWrites = ledger.some(function(e) { return e.tool === "write" || e.tool === "edit"; });
-      if (state.isRisky && !state.blindSpotDone && !hasWrites) {
+      var hasWrites = ledger.length > 0 && ledger.some(function(e) { return e.tool === "write" || e.tool === "edit"; });
+      if (state.isRisky && !state.blindSpotRequested && !hasWrites) {
         parts.push("\n" + BLIND_SPOT_PROMPT);
-        state.blindSpotDone = true;
+        state.blindSpotRequested = true;
       }
 
       // #2: PLAN CONTRACT — before first write in complex modes
-      if (!state.planInjected && !hasWrites && ["audit","debug","coding","financial_verify","financial_analyze"].indexOf(state.currentTaskMode) !== -1) {
+      if (!state.planRequested && !hasWrites && ["audit","debug","coding","financial_verify","financial_analyze"].indexOf(state.currentTaskMode) !== -1) {
         parts.push("\n" + PLAN_CONTRACT_PROMPT);
-        state.planInjected = true;
+        state.planRequested = true;
       }
 
       // #3: PROJECT INVARIANTS — before first write
       if (!state.invariantsInjected && !hasWrites) {
-        var invariants = readInvariants(state.currentTaskMode);
+        var invariants = readInvariants(state.currentTaskMode, _input.directory, _input.worktree);
         if (invariants) parts.push("\n" + invariants);
         state.invariantsInjected = true;
       }
@@ -537,13 +562,35 @@ var fablizePlugin = async function (_input) {
 
           var ledger = ledgers.get(sessionID) || [];
 
-          // #4: DIFF-AWARE REVIEW — before completion gate, if risky/large change
+          // Track: blind-spot completed?
+          if (state.blindSpotRequested && !state.blindSpotDone && hasBlindSpotCompletion(fullText)) {
+            state.blindSpotDone = true;
+          }
+
+          // Track: plan provided?
+          if (state.planRequested && !state.planProvided && hasPlanMarkers(fullText)) {
+            state.planProvided = true;
+          }
+
+          // #4: DIFF-AWARE REVIEW — verify evidence before accepting review
+          if (state.reviewRequested && !state.reviewDone) {
+            // Wait for review evidence (git diff or review verdict)
+            if (/no actionable finding|diff review|adversarial/i.test(fullText)) {
+              state.reviewDone = true;
+            }
+          }
+
           if (DONE_PATTERNS.some(function(re) { return re.test(fullText); })) {
             var writeInfo = countWritesInLedger(ledger);
-            var needsReview = (writeInfo.unique >= 3 || hasRiskyFileChange(ledger)) && !state.reviewDone;
+            var needsReview = (writeInfo.unique >= 3 || hasRiskyFileChange(ledger)) && !state.reviewRequested;
             if (needsReview) {
-              state.pendingCompletionBlock = DIFF_REVIEW_PROMPT;
-              state.reviewDone = true;
+              state.reviewRequested = true;
+              state.pendingCompletionBlock = DIFF_REVIEW_PROMPT + "\n\nFirst run `git diff` or `git diff --check` and inspect the output. Do NOT state the review verdict without tool evidence.";
+              break;
+            }
+            // If review was requested but not done yet → block
+            if (state.reviewRequested && !state.reviewDone) {
+              state.pendingCompletionBlock = "COMPLETION BLOCKED: Diff review was requested but not completed. Run `git diff` and report findings first.";
               break;
             }
           }
@@ -584,7 +631,15 @@ var fablizePlugin = async function (_input) {
       if ((input.tool === "write" || input.tool === "edit") && filePath) {
         var st = stateOf(sessionID);
         if (st.writtenFiles.indexOf(filePath) === -1) st.writtenFiles.push(filePath);
-        st.blindSpotDone = true; // Blind-spot pass is done once first write happens
+        // If blind-spot was requested but not completed, mark it (model proceeded to write)
+        if (st.blindSpotRequested && !st.blindSpotDone) st.blindSpotDone = true;
+        // If plan was requested but not provided, still allow writes (don't hard-block)
+        if (st.planRequested && !st.planProvided) st.planProvided = true;
+      }
+
+      // Track diff review evidence
+      if (input.tool === "bash" && isDiffReviewCommand(command)) {
+        stateOf(sessionID).reviewEvidenceSeen = true;
       }
 
       if (errorFlag) {
