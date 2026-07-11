@@ -1,16 +1,20 @@
-import { readFileSync } from "fs";
+import { readFileSync, existsSync } from "fs";
 
 // ══ CONFIG ══
 var JOURNAL_PATH = "/root/.config/opencode/agent-journal.md";
 var JOURNAL_MAX_ENTRIES = 5;
+var INVARIANTS_PATHS = [
+  process.cwd() + "/.opencode/fablize-invariants.md",
+  "/root/.opencode/fablize-invariants.md",
+];
 
-// ══ LEDGER (declared before session state — cleanupSessions depends on it) ══
+// ══ LEDGER (declared before session state) ══
 var ledgers = new Map();
 var MAX_ENTRIES = 100, RECENT_WINDOW = 10;
 
-// ══ SESSION STATE (isolated per sessionID, with TTL cleanup) ══
+// ══ SESSION STATE (isolated per sessionID, with TTL) ══
 var sessionState = new Map();
-var SESSION_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+var SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 
 function cleanupSessions() {
   var now = Date.now();
@@ -32,8 +36,13 @@ function stateOf(sessionID) {
       pendingJournalSearch: null,
       pendingCompletionBlock: null,
       fullPromptInjected: false,
-      journalInjected: false,
       lastSeenAt: Date.now(),
+      blindSpotDone: false,
+      isRisky: false,
+      planInjected: false,
+      invariantsInjected: false,
+      reviewDone: false,
+      writtenFiles: [],
     });
   }
   var state = sessionState.get(sessionID);
@@ -52,6 +61,12 @@ var FIN_ANALYZE = ["почему","причин","объясни","найди","
 var FIN_HYPO = ["предложи","вариант","что если","гипотез","допустим"];
 var FIN_GEN = ["расчёт","расчет","формул","млн","тыс","excel","xlsx","бюджет","прогноз","budget","forecast","formula","financial","revenue","cost","profit","loss","balance"];
 
+// #1: Risky change keywords — trigger blind-spot gate
+var RISKY_KW = ["migration","миграц","schema","схема","auth","аутентиф","permission","разрешен",
+  "api","endpoint","deploy","deployment","продакшен","production","database","база данных",
+  "sql","trading","торгов","order","ордер","payment","платёж","payment","money","деньг",
+  "refactor","рефактор","architecture","архитектур"];
+
 function detectTaskMode(text) {
   var t = (text || "").toLowerCase();
   for (var i = 0; i < CREATIVE_KW.length; i++) if (t.indexOf(CREATIVE_KW[i]) !== -1) return "creative";
@@ -66,7 +81,13 @@ function detectTaskMode(text) {
   return "default";
 }
 
-// ══ FINANCIAL RULES (R6-R9) — task-specific ══
+function detectRisky(text) {
+  var t = (text || "").toLowerCase();
+  for (var i = 0; i < RISKY_KW.length; i++) if (t.indexOf(RISKY_KW[i]) !== -1) return true;
+  return false;
+}
+
+// ══ FINANCIAL RULES (R6-R9) ══
 var FINANCIAL_RULES = [
   "## Rule 6 — No mental math for financial calculations",
   "Numbers > 100 in arithmetic: ALWAYS run Python. Mental math for money is FORBIDDEN.",
@@ -77,27 +98,63 @@ var FINANCIAL_RULES = [
   "## Rule 9 — Show conversion formulas",
   "When converting: '452 000 / 1000 = 452.0 млн'. Never bare converted value."
 ].join("\n");
-var FINANCIAL_MODES = ["audit", "financial_verify", "financial_analyze", "financial_hypothesis", "financial_general"];
+var FINANCIAL_MODES = ["audit","financial_verify","financial_analyze","financial_hypothesis","financial_general"];
 
-// ══ TASK PROMPTS (P1-6: added coding profile) ══
 var TASK_PROMPTS = {
   "audit": "--- TASK MODE: AUDIT ---\nCheck ALL control sums. Convert тыс→млн EXPLICITLY (÷1000).\nTrace discrepancies to source cells. Compare cross-sheet values.\nALL calculations via Python. State units (R8). Show conversions (R9).",
-  "debug": "--- TASK MODE: DEBUG ---\nReproduce error FIRST: show command + output.\n3+ competing hypotheses. Causal chain: root cause → mechanism → symptom.\nKeep diff scoped; do not refactor unrelated code.\nAfter fix: RE-RUN failing case with real verification command (test/lint/typecheck). No 'fixed' without re-run.",
+  "debug": "--- TASK MODE: DEBUG ---\nReproduce error FIRST: show command + output.\n3+ competing hypotheses. Causal chain: root cause → mechanism → symptom.\nKeep diff scoped; do not refactor unrelated code.\nAfter fix: RE-RUN failing case with real verification command. No 'fixed' without re-run.",
   "coding": "--- TASK MODE: CODING ---\nInspect nearest implementation and its tests before editing.\nKeep diff scoped; do not refactor unrelated code.\nAfter last code edit: run smallest relevant verification (test/lint/typecheck).\nFor bug fixes: show failing scenario, fix, then rerun.\nReport: files changed, verification result, unverified risk.\nDo NOT claim a test passed without showing its output.",
   "create": "--- TASK MODE: CREATE ---\nAfter creating: READ FILE BACK. Confirm content matches intent.\nShow key parts as evidence. Run applicable tests/checks."
 };
 function getTaskPrompt(mode) { return TASK_PROMPTS[mode] || null; }
 function needsFinancialRules(mode) { return FINANCIAL_MODES.indexOf(mode) !== -1; }
 
+// ══ CONDITIONAL PROMPT BLOCKS (#1-#4) ══
+
+// #1: Blind-spot gate
+var BLIND_SPOT_PROMPT = [
+  "--- BLIND-SPOT PASS (before editing) ---",
+  "List only material unknowns that could change the implementation:",
+  "- Ambiguous behavior or acceptance criterion",
+  "- Existing contract/API/schema constraint",
+  "- Backward-compat, migration, security, production, or money risk",
+  "- Missing test oracle or unclear source of truth",
+  "For each unknown choose: A. Resolve from repo evidence, B. Safe default + proceed, C. Ask user one blocking question.",
+  "Do not ask questions answerable by reading the repository.",
+  "If no material unknowns: write 'No blocking unknowns found' and proceed."
+].join("\n");
+
+// #2: Plan as contract
+var PLAN_CONTRACT_PROMPT = [
+  "--- IMPLEMENTATION CONTRACT (before first write) ---",
+  "Before editing files, state briefly:",
+  "Goal: <one sentence>",
+  "In scope: <files/areas>",
+  "Out of scope: <what you will NOT touch>",
+  "Acceptance checks: <how to verify success>",
+  "Risks/rollback: <what could break, how to undo>",
+  "Then proceed. If scope expands during work, state why explicitly."
+].join("\n");
+
+// #4: Diff-aware review pass
+var DIFF_REVIEW_PROMPT = [
+  "--- FINAL DIFF REVIEW ---",
+  "Read the current diff as an adversarial reviewer. Report ONLY actionable findings:",
+  "- Contract break / backward incompatibility",
+  "- Missing failure-path test",
+  "- Security or data-loss risk",
+  "- Incorrect assumption relative to nearby code",
+  "- Scope creep beyond stated goal",
+  "For every finding cite file and line. Do NOT modify code in this pass.",
+  "If no issues: state 'No actionable finding after diff review.'"
+].join("\n");
+
 // ══ COMPLETION DETECTION ══
 var DONE_PATTERNS = [
   /\b(done|fixed|implemented|resolved|complete|finished|verified)\b/i,
   /(готово|исправлено|реализовано|решено|завершено|проверено|сделано)/i
 ];
-// P1-4: Replaced broad LAZYPATTERNS with minimal UNSUPPORTED_CLAIMS
-var UNSUPPORTED_CLAIMS = [
-  /this should work/i, /i assume/i, /это должно работать/i, /я предполагаю/i
-];
+var UNSUPPORTED_CLAIMS = [/this should work/i, /i assume/i, /это должно работать/i, /я предполагаю/i];
 
 function detectUnsupportedClaim(text) {
   if (!text || typeof text !== "string") return null;
@@ -105,7 +162,7 @@ function detectUnsupportedClaim(text) {
   return null;
 }
 
-// ══ P0: VERIFICATION COMMAND CLASSIFICATION (^ anchored, strict) ══
+// ══ VERIFICATION CLASSIFICATION ══
 function extractCommand(args) {
   if (!args) return "";
   return String(args.command || args.cmd || args.script || "").trim();
@@ -123,65 +180,42 @@ var VERIFICATION_PATTERNS = [
 function isVerificationCommand(command) {
   var c = (command || "").trim().toLowerCase();
   if (!c) return false;
-  for (var i = 0; i < VERIFICATION_PATTERNS.length; i++) {
-    if (VERIFICATION_PATTERNS[i].test(c)) return true;
-  }
-  // Financial verification: python script (not just print)
+  for (var i = 0; i < VERIFICATION_PATTERNS.length; i++) if (VERIFICATION_PATTERNS[i].test(c)) return true;
   if (/^python/.test(c) && /\.(py|csv|xlsx)/.test(c)) return true;
   return false;
 }
 
-// ══ P0-2 + P0-3: COMPLETION GATE (enhanced) ══
-var WORK_MODES = ["create", "debug", "coding", "audit", "financial_verify", "financial_analyze", "financial_hypothesis", "financial_general"];
+// ══ COMPLETION GATE ══
+var WORK_MODES = ["create","debug","coding","audit","financial_verify","financial_analyze","financial_hypothesis","financial_general"];
 
 function checkCompletionGate(text, ledger, taskMode) {
   if (!text) return null;
-  var isDone = DONE_PATTERNS.some(function(re) { return re.test(text); });
-  if (!isDone) return null;
-
-  // P0-3: Empty ledger blocks done in work modes
-  if ((!ledger || ledger.length === 0) && WORK_MODES.indexOf(taskMode) !== -1) {
-    return "COMPLETION BLOCKED: Response claims completion, but this session has NO tool evidence. " +
-      "Execute the requested work first (read, calculate, test), then report the result.";
-  }
+  if (!DONE_PATTERNS.some(function(re) { return re.test(text); })) return null;
+  if ((!ledger || ledger.length === 0) && WORK_MODES.indexOf(taskMode) !== -1)
+    return "COMPLETION BLOCKED: Response claims completion, but this session has NO tool evidence.";
   if (!ledger || ledger.length === 0) return null;
 
-  // Find last write/edit
   var lastWriteIdx = -1;
-  for (var i = ledger.length - 1; i >= 0; i--) {
+  for (var i = ledger.length - 1; i >= 0; i--)
     if (ledger[i].tool === "write" || ledger[i].tool === "edit") { lastWriteIdx = i; break; }
-  }
   if (lastWriteIdx === -1) return null;
 
-  // P0-2 + P1: Require VERIFICATION command relevant to the changed file type
-  var changedFile = ledger[lastWriteIdx].filePath || "";
-  var changedExt = changedFile ? changedFile.split(".").pop().toLowerCase() : "";
-
+  var changedExt = ledger[lastWriteIdx].filePath ? ledger[lastWriteIdx].filePath.split(".").pop().toLowerCase() : "";
   for (var j = lastWriteIdx + 1; j < ledger.length; j++) {
-    var entry = ledger[j];
-    if (entry.tool === "bash" && entry.exitCode === 0 && !entry.hasError && entry.isVerification) {
-      // Check relevance: verify command should match the changed file type
-      if (isRelevantVerification(entry.command, changedExt)) return null;
-    }
+    var e = ledger[j];
+    if (e.tool === "bash" && e.exitCode === 0 && !e.hasError && e.isVerification && isRelevantVerification(e.command, changedExt))
+      return null;
   }
-  return "COMPLETION BLOCKED: After the last file change (step " + (lastWriteIdx + 1) +
-    ": " + ledger[lastWriteIdx].title + "), there is NO relevant verification command. " +
-    "Run a check that matches the changed file type (." + (changedExt || "?") + ") " +
-    "or state exactly why it cannot be run.";
+  return "COMPLETION BLOCKED: After last file change, NO relevant verification. Run matching check or explain why.";
 }
 
 function isRelevantVerification(command, fileExt) {
-  if (!command || !fileExt) return true; // No file type info → accept any verification
+  if (!command || !fileExt) return true;
   var c = command.toLowerCase();
-  var pyExts = ["py", "csv", "xlsx", "jsonl"];
-  var tsExts = ["ts", "tsx", "js", "jsx", "mjs"];
-  var goExts = ["go"];
-  var rsExts = ["rs"];
-  if (pyExts.indexOf(fileExt) !== -1 && /(pytest|ruff|mypy|pyright|python)/.test(c)) return true;
-  if (tsExts.indexOf(fileExt) !== -1 && /(npm|pnpm|yarn|tsc|eslint|prettier)/.test(c)) return true;
-  if (goExts.indexOf(fileExt) !== -1 && /go\s+(test|vet)/.test(c)) return true;
-  if (rsExts.indexOf(fileExt) !== -1 && /cargo/.test(c)) return true;
-  // Generic: make or unknown type → accept
+  if (["py","csv","xlsx","jsonl"].indexOf(fileExt) !== -1 && /(pytest|ruff|mypy|pyright|python)/.test(c)) return true;
+  if (["ts","tsx","js","jsx","mjs"].indexOf(fileExt) !== -1 && /(npm|pnpm|yarn|tsc|eslint|prettier)/.test(c)) return true;
+  if (fileExt === "go" && /go\s+(test|vet)/.test(c)) return true;
+  if (fileExt === "rs" && /cargo/.test(c)) return true;
   if (/make\s+/.test(c)) return true;
   return false;
 }
@@ -193,30 +227,24 @@ function extractKeyNumbers(output) {
   var lines = output.split("\n");
   for (var i = 0; i < lines.length && numbers.length < 5; i++) {
     var match = lines[i].match(/([A-Za-zА-Яа-яЁё][\w\s]{0,25}?)\s*[=:]\s*(-?\d{1,12}[.,]?\d{0,4})/);
-    if (match) {
-      var key = match[1].trim(), val = match[2].replace(",", ".");
-      if (key.length > 1 && Math.abs(parseFloat(val)) > 0) numbers.push(key + "=" + val);
-    }
+    if (match) { var k = match[1].trim(), v = match[2].replace(",", "."); if (k.length > 1 && Math.abs(parseFloat(v)) > 0) numbers.push(k + "=" + v); }
   }
   return numbers;
 }
 
-// P1-5: hasError uses exit code as primary source of truth
 function hasError(output, exitCode) {
   if (exitCode !== null && exitCode !== undefined) return exitCode !== 0;
   if (!output) return false;
   var s = String(output).toLowerCase();
   if (/\b(traceback|exception|fatal error|command not found)\b/.test(s)) return true;
   if (/\b(failed|error)\b/.test(s) && !/\b(0 errors|no errors|0 failed|all tests passed|error handling)\b/.test(s)) return true;
-  if (s.indexOf("расхождение") !== -1) return true;
-  return false;
+  return s.indexOf("расхождение") !== -1;
 }
 
 function extractExitCode(output, metadata) {
   if (metadata && typeof metadata.exit !== "undefined") return metadata.exit;
   if (!output) return null;
-  var s = String(output);
-  var m = s.match(/exit code:?\s*(\d+)/i) || s.match(/EXIT:(\d+)/);
+  var m = String(output).match(/exit code:?\s*(\d+)/i) || String(output).match(/EXIT:(\d+)/);
   return m ? parseInt(m[1]) : null;
 }
 
@@ -225,16 +253,12 @@ function extractTestResult(output) {
   var m = output.match(/(\d+)\s*(passed|tests?\s*passed|test[s]?\s*passing)/i);
   if (m) return m[1] + " passed";
   m = output.match(/(\d+)\s*(failed|failing)\b/i);
-  if (m) return m[1] + " failed";
-  return null;
+  return m ? m[1] + " failed" : null;
 }
 
-function extractFilePath(args) {
-  if (!args) return null;
-  return args.filePath || args.path || args.file || null;
-}
+function extractFilePath(args) { return args ? (args.filePath || args.path || args.file || null) : null; }
 
-// ══ ERROR KEYWORD + JOURNAL SEARCH ══
+// ══ JOURNAL + INVARIANTS ══
 function extractErrorKeywords(output) {
   if (!output) return null;
   var lower = output.toLowerCase();
@@ -255,18 +279,45 @@ function searchJournal(keywords) {
     var matches = [];
     for (var i = 1; i < blocks.length && matches.length < 2; i++) {
       var lower = blocks[i].toLowerCase();
-      for (var k = 0; k < keywords.length; k++) {
-        if (lower.indexOf(keywords[k].toLowerCase()) !== -1) {
-          matches.push(blocks[i].trim().split("\n").slice(0, 8).join("\n"));
-          break;
-        }
-      }
+      for (var k = 0; k < keywords.length; k++)
+        if (lower.indexOf(keywords[k].toLowerCase()) !== -1) { matches.push(blocks[i].trim().split("\n").slice(0, 8).join("\n")); break; }
     }
     return matches.length > 0 ? matches.join("\n\n") : null;
   } catch (e) { return null; }
 }
 
-// ══ DISCIPLINE PROMPT (base: R1-5, R10) ══
+// #3: Project invariants
+function readInvariants(taskMode) {
+  for (var p = 0; p < INVARIANTS_PATHS.length; p++) {
+    var path = INVARIANTS_PATHS[p];
+    if (!existsSync(path)) continue;
+    try {
+      var content = readFileSync(path, "utf-8");
+      var sections = content.split(/^## /m);
+      var modeKw = {
+        "audit": ["financial","finance","audit","аудит","финанс"],
+        "financial_verify": ["financial","finance","reconcil","финанс","сверк"],
+        "debug": ["debug","error","infra","инфра","ошибк"],
+        "coding": ["code","api","coding","код"],
+        "create": ["create","deploy","инфра"],
+      };
+      var kws = modeKw[taskMode] || [];
+      for (var s = 1; s < sections.length; s++) {
+        var sectionLower = sections[s].toLowerCase();
+        for (var ki = 0; ki < kws.length; ki++) {
+          if (sectionLower.indexOf(kws[ki]) !== -1) {
+            var lines = sections[s].trim().split("\n").slice(0, 8);
+            return "--- PROJECT INVARIANTS ---\n" + lines.join("\n");
+          }
+        }
+      }
+      return null; // File exists but no matching section
+    } catch (e) { return null; }
+  }
+  return null;
+}
+
+// ══ DISCIPLINE PROMPT ══
 var DISCIPLINE_PROMPT = [
   "<fablize-discipline — ENFORCED EXECUTION DISCIPLINE>",
   "Not optional. Violating them produces incorrect work.",
@@ -276,12 +327,11 @@ var DISCIPLINE_PROMPT = [
   "",
   "## Rule 2 — Completion gate (programmatic)",
   "For 2+ steps: decompose, evidence per step, refuse groundless \"done\".",
-  "The plugin checks PROGRAMMATICALLY: write/edit without a real verification command after → BLOCKED.",
-  "Only test/lint/typecheck/build commands count as verification. echo/pwd/git status do NOT.",
-  "Empty ledger + done claim in work modes → BLOCKED.",
+  "Plugin checks PROGRAMMATICALLY: write/edit without relevant verification → BLOCKED.",
+  "Empty ledger + done in work modes → BLOCKED.",
   "",
   "## Rule 3 — Systematic investigation",
-  "Reproduce → 2+ hypotheses → evidence per hypothesis → causal chain end-to-end.",
+  "Reproduce → 2+ hypotheses → evidence each → causal chain end-to-end.",
   "",
   "## Rule 4 — No unsupported claims",
   "FORBIDDEN: \"this should work\", \"I assume\". If impossible: \"BLOCKED: reason\".",
@@ -290,8 +340,7 @@ var DISCIPLINE_PROMPT = [
   "After non-trivial tasks: append to /root/.config/opencode/agent-journal.md.",
   "",
   "## Rule 10 — Persistence before BLOCKED",
-  "Try at least 2 approaches. But NEVER retry: production data changes, credential rotation,",
-  "destructive migrations, financial operations. Ask for confirmation instead.",
+  "Try 2+ approaches. NEVER retry: production data, credentials, destructive migrations, financial ops.",
   "",
   "## Evidence ledger",
   "Every tool call tracked with exit codes, test results, file paths, verification status.",
@@ -301,10 +350,9 @@ var DISCIPLINE_PROMPT = [
   "</fablize-discipline>"
 ].join("\n");
 
-var DISCIPLINE_SHORT = "<fablize-active> Verify before done (R1) | Completion auto-gated: write→real verify needed (R2) | 2+ hypotheses (R3) | No unsupported claims (R4) | Journal (R5) | Try 2+ but NOT for destructive ops (R10). Financial rules (R6-R9) in task prompt. </fablize-active>";
+var DISCIPLINE_SHORT = "<fablize-active> Verify before done (R1) | Write→relevant verify (R2) | 2+ hypotheses (R3) | No unsupported claims (R4) | Journal (R5) | Try 2+ not for destructive ops (R10). Financial R6-R9 in task prompt. </fablize-active>";
 
-// ══ LEDGER FUNCTIONS (ledgers + MAX_ENTRIES declared at top of file) ══
-
+// ══ LEDGER FUNCTIONS ══
 function recordEvidence(sessionID, entry) {
   if (!ledgers.has(sessionID)) ledgers.set(sessionID, []);
   var entries = ledgers.get(sessionID);
@@ -315,8 +363,7 @@ function recordEvidence(sessionID, entry) {
 function getLedgerSummary(sessionID) {
   if (!sessionID) return "";
   var entries = ledgers.get(sessionID);
-  if (!entries || entries.length === 0)
-    return "\n\n--- EVIDENCE LEDGER: empty. 'done' without tool calls = blocked in work modes. ---";
+  if (!entries || entries.length === 0) return "\n\n--- EVIDENCE LEDGER: empty. 'done' without tool calls = blocked in work modes. ---";
   var startIdx = Math.max(0, entries.length - RECENT_WINDOW);
   var recent = entries.slice(startIdx);
   var lines = [];
@@ -333,25 +380,32 @@ function getLedgerSummary(sessionID) {
     lines.push(line);
   }
   return "\n\n--- EVIDENCE LEDGER (" + entries.length + " call" + (entries.length === 1 ? "" : "s") +
-    (entries.length > RECENT_WINDOW ? ", last " + RECENT_WINDOW : "") + ") ---\n" +
-    lines.join("\n") + "\n--- END LEDGER ---";
+    (entries.length > RECENT_WINDOW ? ", last " + RECENT_WINDOW : "") + ") ---\n" + lines.join("\n") + "\n--- END LEDGER ---";
 }
 
-// ══ JOURNAL ══
-function readLastJournalEntries(count) {
-  try {
-    var content = readFileSync(JOURNAL_PATH, "utf-8");
-    var blocks = content.split(/(?=\n## \d{4}-\d{2}-\d{2})/);
-    if (blocks.length <= 1) return "";
-    var entries = blocks.slice(1).slice(-count);
-    var result = "";
-    for (var i = 0; i < entries.length; i++)
-      result += entries[i].trim().split("\n").slice(0, 15).join("\n") + "\n\n";
-    return result;
-  } catch (e) { return "(journal not readable yet)\n"; }
+function countWritesInLedger(ledger) {
+  var count = 0, files = {};
+  for (var i = 0; i < ledger.length; i++) {
+    if ((ledger[i].tool === "write" || ledger[i].tool === "edit") && ledger[i].filePath) {
+      files[ledger[i].filePath] = true;
+      count++;
+    }
+  }
+  return { total: count, unique: Object.keys(files).length, files: Object.keys(files) };
 }
 
-// ══ PLUGIN (4 hooks) ══
+function hasRiskyFileChange(ledger) {
+  var riskyPatterns = ["migration","schema","auth","permission","api","config",".env","secret","deploy","terraform","sql"];
+  for (var i = 0; i < ledger.length; i++) {
+    if (ledger[i].filePath) {
+      var fp = ledger[i].filePath.toLowerCase();
+      for (var j = 0; j < riskyPatterns.length; j++) if (fp.indexOf(riskyPatterns[j]) !== -1) return true;
+    }
+  }
+  return false;
+}
+
+// ══ PLUGIN (4 hooks + 4 conditional mechanisms) ══
 var fablizePlugin = async function (_input) {
   return {
 
@@ -360,6 +414,7 @@ var fablizePlugin = async function (_input) {
       var state = stateOf(sessionID);
       var parts = [];
 
+      // Two-tier prompt
       if (!state.fullPromptInjected) {
         state.fullPromptInjected = true;
         state.previousTaskMode = state.currentTaskMode;
@@ -377,27 +432,46 @@ var fablizePlugin = async function (_input) {
         }
       }
 
+      // #1: BLIND-SPOT GATE — only before risky changes, before any writes
+      var ledger = ledgers.get(sessionID) || [];
+      var hasWrites = ledger.some(function(e) { return e.tool === "write" || e.tool === "edit"; });
+      if (state.isRisky && !state.blindSpotDone && !hasWrites) {
+        parts.push("\n" + BLIND_SPOT_PROMPT);
+        state.blindSpotDone = true;
+      }
+
+      // #2: PLAN CONTRACT — before first write in complex modes
+      if (!state.planInjected && !hasWrites && ["audit","debug","coding","financial_verify","financial_analyze"].indexOf(state.currentTaskMode) !== -1) {
+        parts.push("\n" + PLAN_CONTRACT_PROMPT);
+        state.planInjected = true;
+      }
+
+      // #3: PROJECT INVARIANTS — before first write
+      if (!state.invariantsInjected && !hasWrites) {
+        var invariants = readInvariants(state.currentTaskMode);
+        if (invariants) parts.push("\n" + invariants);
+        state.invariantsInjected = true;
+      }
+
+      // Completion gate
       if (state.pendingCompletionBlock) {
         parts.push("\n--- " + state.pendingCompletionBlock + " ---\n");
         state.pendingCompletionBlock = null;
       }
 
-      // P1-4: Unsupported claims (replaces old anti-laziness)
+      // Unsupported claims
       if (state.pendingWarning) {
-        parts.push("\n--- UNSUPPORTED CLAIM DETECTED ---");
-        parts.push("Previous response used: \"" + state.pendingWarning + "\" without evidence.");
-        parts.push("Provide evidence or retract the claim.\n");
+        parts.push("\n--- UNSUPPORTED CLAIM ---");
+        parts.push("\"" + state.pendingWarning + "\" without evidence. Provide evidence or retract.\n");
         state.pendingWarning = null;
       }
 
+      // Journal error-context search
       if (state.pendingJournalSearch) {
         var jMatches = searchJournal(state.pendingJournalSearch);
-        if (jMatches) parts.push("\n--- JOURNAL MATCH (error context) ---\n" + jMatches + "\n");
+        if (jMatches) parts.push("\n--- JOURNAL MATCH ---\n" + jMatches + "\n");
         state.pendingJournalSearch = null;
       }
-
-      // P2: Journal auto-injection disabled — keep only error-context search
-      // (re-enabled per-project when structured JSONL + projectId available)
 
       parts.push(getLedgerSummary(sessionID));
       output.system.push(parts.join("\n"));
@@ -411,19 +485,18 @@ var fablizePlugin = async function (_input) {
         if (typeof msgText !== "string") msgText = JSON.stringify(msgText) || "";
       }
       var mode = detectTaskMode(msgText);
-      if (sessionID) stateOf(sessionID).currentTaskMode = mode;
+      if (sessionID) {
+        var st = stateOf(sessionID);
+        st.currentTaskMode = mode;
+        st.isRisky = st.isRisky || detectRisky(msgText);
+      }
 
-      // P1-b/c: Only set params if not already specified; use 'high' for non-critical modes
       var tempMap = {
-        "creative":{temp:0.7,effort:"high"},
-        "audit":{temp:0.1,effort:"max"},
-        "debug":{temp:0.2,effort:"max"},
-        "coding":{temp:0.2,effort:"high"},
+        "creative":{temp:0.7,effort:"high"},"audit":{temp:0.1,effort:"max"},
+        "debug":{temp:0.2,effort:"max"},"coding":{temp:0.2,effort:"high"},
         "create":{temp:0.3,effort:"high"},
-        "financial_verify":{temp:0.1,effort:"max"},
-        "financial_analyze":{temp:0.4,effort:"max"},
-        "financial_hypothesis":{temp:0.6,effort:"high"},
-        "financial_general":{temp:0.2,effort:"max"},
+        "financial_verify":{temp:0.1,effort:"max"},"financial_analyze":{temp:0.4,effort:"max"},
+        "financial_hypothesis":{temp:0.6,effort:"high"},"financial_general":{temp:0.2,effort:"max"},
         "default":{temp:0.3,effort:"high"}
       };
       var settings = tempMap[mode] || tempMap["default"];
@@ -437,14 +510,9 @@ var fablizePlugin = async function (_input) {
       try {
         if (!msgOutput || !msgOutput.messages || msgOutput.messages.length === 0) return;
 
-        // P0-1: Get sessionID from message info (not global lastSessionID)
         var sessionID = null;
-        for (var si = msgOutput.messages.length - 1; si >= 0; si--) {
-          if (msgOutput.messages[si].info && msgOutput.messages[si].info.sessionID) {
-            sessionID = msgOutput.messages[si].info.sessionID;
-            break;
-          }
-        }
+        for (var si = msgOutput.messages.length - 1; si >= 0; si--)
+          if (msgOutput.messages[si].info && msgOutput.messages[si].info.sessionID) { sessionID = msgOutput.messages[si].info.sessionID; break; }
         if (!sessionID) {
           if (process.env.FABLIZE_DEBUG === "1") console.error("[fablize] completion check skipped: sessionID unavailable");
           return;
@@ -456,8 +524,7 @@ var fablizePlugin = async function (_input) {
 
         for (var i = msgOutput.messages.length - 1; i >= 0; i--) {
           var msg = msgOutput.messages[i];
-          var isAssistant = msg.info && (msg.info.role === "assistant" || msg.info.roleID === "assistant");
-          if (!isAssistant) continue;
+          if (!msg.info || (msg.info.role !== "assistant" && msg.info.roleID !== "assistant")) continue;
 
           var fullText = "", hasToolCall = false;
           if (msg.parts) {
@@ -469,6 +536,19 @@ var fablizePlugin = async function (_input) {
           }
 
           var ledger = ledgers.get(sessionID) || [];
+
+          // #4: DIFF-AWARE REVIEW — before completion gate, if risky/large change
+          if (DONE_PATTERNS.some(function(re) { return re.test(fullText); })) {
+            var writeInfo = countWritesInLedger(ledger);
+            var needsReview = (writeInfo.unique >= 3 || hasRiskyFileChange(ledger)) && !state.reviewDone;
+            if (needsReview) {
+              state.pendingCompletionBlock = DIFF_REVIEW_PROMPT;
+              state.reviewDone = true;
+              break;
+            }
+          }
+
+          // Normal completion gate
           var completionBlock = checkCompletionGate(fullText, ledger, state.currentTaskMode);
           if (completionBlock) {
             state.pendingCompletionBlock = completionBlock;
@@ -485,27 +565,27 @@ var fablizePlugin = async function (_input) {
       var sessionID = input.sessionID;
       var outStr = "";
       var metadata = output && output.metadata ? output.metadata : {};
-      if (output && output.output)
-        outStr = typeof output.output === "string" ? output.output : JSON.stringify(output.output);
+      if (output && output.output) outStr = typeof output.output === "string" ? output.output : JSON.stringify(output.output);
 
       var exitCode = extractExitCode(outStr, metadata);
       var errorFlag = hasError(outStr, exitCode);
       var title = (output && output.title) ? output.title : "(" + input.tool + ")";
       var command = extractCommand(input.args);
+      var filePath = extractFilePath(input.args);
 
       recordEvidence(sessionID, {
-        tool: input.tool,
-        callID: input.callID,
-        title: title,
-        command: command,
-        timestamp: Date.now(),
-        keyNumbers: extractKeyNumbers(outStr),
-        hasError: errorFlag,
-        exitCode: exitCode,
-        testResult: extractTestResult(outStr),
-        filePath: extractFilePath(input.args),
+        tool: input.tool, callID: input.callID, title: title, command: command,
+        timestamp: Date.now(), keyNumbers: extractKeyNumbers(outStr), hasError: errorFlag,
+        exitCode: exitCode, testResult: extractTestResult(outStr), filePath: filePath,
         isVerification: input.tool === "bash" ? isVerificationCommand(command) : false,
       });
+
+      // Track written files
+      if ((input.tool === "write" || input.tool === "edit") && filePath) {
+        var st = stateOf(sessionID);
+        if (st.writtenFiles.indexOf(filePath) === -1) st.writtenFiles.push(filePath);
+        st.blindSpotDone = true; // Blind-spot pass is done once first write happens
+      }
 
       if (errorFlag) {
         var errorKws = extractErrorKeywords(outStr);
