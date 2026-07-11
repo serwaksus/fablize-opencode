@@ -4,15 +4,34 @@ import { readFileSync } from "fs";
 var JOURNAL_PATH = "/root/.config/opencode/agent-journal.md";
 var JOURNAL_MAX_ENTRIES = 5;
 
+// ══ FIX 1: SESSION STATE ISOLATION ══
+var sessionState = new Map();
+var lastSessionID = null;
+
+function stateOf(sessionID) {
+  if (!sessionState.has(sessionID)) {
+    sessionState.set(sessionID, {
+      currentTaskMode: "default",
+      previousTaskMode: null,
+      pendingLazyWarning: null,
+      pendingJournalSearch: null,
+      pendingCompletionBlock: null,
+      fullPromptInjected: false,
+      journalInjected: false,
+    });
+  }
+  return sessionState.get(sessionID);
+}
+
 // ══ TASK MODE DETECTION ══
 var AUDIT_KW = ["аудит","сверк","ebitda","дебет","кредит","сальдо","проводк","audit","reconcil"];
-var DEBUG_KW = ["баг","ошибк","не работает","сломал","падает","крашит","висит","debug","error","crash","broken","fail","traceback","exception","not working"];
+var DEBUG_KW = ["баг","ошибк","не работает","сломал","падает","крашит","висит","debug","error","crash","broken","fail","traceback","exception"];
 var CREATE_KW = ["создай","сделай файл","напиши файл","сгенерир","создать","построй","create","generate","build","scaffold"];
 var CREATIVE_KW = ["напиши текст","придумай","brainstorm","creative","сочини","слоган","стих","рассказ"];
 var FIN_VERIFY = ["сверк","проверь","контрольн","сход","бьётс"];
 var FIN_ANALYZE = ["почему","причин","объясни","найди","откуда","из-за"];
 var FIN_HYPO = ["предложи","вариант","что если","гипотез","допустим"];
-var FIN_GEN = ["расчёт","расчет","формул","млн","тыс","excel","xlsx","бюджет","прогноз","кассов","budget","forecast","formula","financial","revenue","cost","profit","loss","balance"];
+var FIN_GEN = ["расчёт","расчет","формул","млн","тыс","excel","xlsx","бюджет","прогноз","budget","forecast","formula","financial","revenue","cost","profit","loss","balance"];
 
 function detectTaskMode(text) {
   var t = (text || "").toLowerCase();
@@ -27,31 +46,67 @@ function detectTaskMode(text) {
   return "default";
 }
 
+// ══ FIX 3: FINANCIAL RULES (R6-R9) — task-specific, not in base prompt ══
+var FINANCIAL_RULES = [
+  "## Rule 6 — No mental math for financial calculations",
+  "Numbers > 100 in arithmetic: ALWAYS run Python. Mental math for money is FORBIDDEN.",
+  "",
+  "## Rule 7 — Step references",
+  "Cite numbers with source: \"as computed in step 3 (ledger #3: sum=787)\".",
+  "",
+  "## Rule 8 — Always state units",
+  "EVERY number MUST have units: '452 000 тыс. руб. (= 452.0 млн руб.)'.",
+  "",
+  "## Rule 9 — Show conversion formulas",
+  "When converting: '452 000 / 1000 = 452.0 млн'. Never bare converted value."
+].join("\n");
+
+var FINANCIAL_MODES = ["audit", "financial_verify", "financial_analyze", "financial_hypothesis", "financial_general"];
+
 var TASK_PROMPTS = {
   "audit": "--- TASK MODE: AUDIT ---\nCheck ALL control sums. Convert тыс→млн EXPLICITLY (÷1000).\nTrace discrepancies to source cells. Compare cross-sheet values.\nALL calculations via Python. State units (R8). Show conversions (R9).",
   "debug": "--- TASK MODE: DEBUG ---\nReproduce error FIRST: show command + output.\n3+ competing hypotheses. Causal chain: root cause → mechanism → symptom.\nAfter fix: RE-RUN failing case. No 'fixed' without re-run.",
   "create": "--- TASK MODE: CREATE ---\nAfter creating: READ FILE BACK. Confirm content matches intent.\nShow key parts as evidence. Run applicable tests/checks."
 };
 function getTaskPrompt(mode) { return TASK_PROMPTS[mode] || null; }
+function needsFinancialRules(mode) { return FINANCIAL_MODES.indexOf(mode) !== -1; }
 
-// ══ LAZINESS DETECTION ══
-var LAZY_PATTERNS = [
-  /i'?ll do/i,/i will do/i,/let me check/i,/let me verify/i,/i'?ll verify/i,
-  /i will verify/i,/let me look/i,/i'?ll look/i,/i'?ll check/i,/i will check/i,
-  /i'?ll run/i,/let me run/i,/i'?ll test/i,/this should work/i,/this will likely/i,
-  /the rest is similar/i,/i assume/i,/i believe/i,
-  /давайте проверим/i,/давайте сверим/i,/сейчас посмотрю/i,/сейчас проверю/i,
-  /нужно посмотреть/i,/нужно проверить/i,/я проверю/i,/я сверю/i,
-  /это должно работать/i,/я сейчас сделаю/i,/осталось проверить/i,
-  /далее проверим/i,/я посмотрю/i,/осталось сверить/i
+// ══ COMPLETION DETECTION (replaces laziness + self-rating) ══
+var DONE_PATTERNS = [
+  /\b(done|fixed|implemented|resolved|complete|finished|verified)\b/i,
+  /\b(готово|исправлено|реализовано|решено|завершено|проверено)\b/i
 ];
+var LAZY_PATTERNS = [
+  /i'?ll do/i,/let me check/i,/i'?ll verify/i,/i'?ll check/i,/i'?ll run/i,
+  /this should work/i,/i assume/i,/давайте проверим/i,/сейчас проверю/i,
+  /нужно проверить/i,/я проверю/i,/осталось проверить/i
+];
+
 function detectLaziness(text) {
   if (!text || typeof text !== "string") return null;
   for (var i = 0; i < LAZY_PATTERNS.length; i++) { var m = text.match(LAZY_PATTERNS[i]); if (m) return m[0]; }
   return null;
 }
 
-// ══ KEY NUMBER EXTRACTION ══
+// ══ FIX 2: PROGRAMMATIC COMPLETION GATE ══
+function checkCompletionGate(text, ledger) {
+  if (!text || !ledger || ledger.length === 0) return null;
+  var isDone = DONE_PATTERNS.some(function(re) { return re.test(text); });
+  if (!isDone) return null;
+  var lastWriteIdx = -1;
+  for (var i = ledger.length - 1; i >= 0; i--) {
+    if (ledger[i].tool === "write" || ledger[i].tool === "edit") { lastWriteIdx = i; break; }
+  }
+  if (lastWriteIdx === -1) return null;
+  for (var j = lastWriteIdx + 1; j < ledger.length; j++) {
+    if (ledger[j].tool === "bash" && ledger[j].exitCode === 0 && !ledger[j].hasError) return null;
+  }
+  return "COMPLETION BLOCKED: After the last file change (step " + (lastWriteIdx + 1) +
+    ": " + ledger[lastWriteIdx].title + "), there is NO successful verification command. " +
+    "Run the smallest relevant check (test/lint/typecheck) or state exactly why it cannot be run.";
+}
+
+// ══ FIX 4: ENHANCED EVIDENCE EXTRACTION ══
 function extractKeyNumbers(output) {
   if (!output || typeof output !== "string") return [];
   var numbers = [];
@@ -68,20 +123,42 @@ function extractKeyNumbers(output) {
 
 function hasError(output) {
   if (!output) return false;
-  var s = String(output);
-  return s.indexOf("Error") !== -1 || s.indexOf("Traceback") !== -1 ||
-    s.indexOf("РАСХОЖДЕНИЕ") !== -1 || s.indexOf("FAILED") !== -1 ||
+  var s = String(output).toLowerCase();
+  return s.indexOf("error") !== -1 || s.indexOf("traceback") !== -1 ||
+    s.indexOf("расхождение") !== -1 || s.indexOf("failed") !== -1 ||
     s.indexOf("exit code: 1") !== -1 || s.indexOf("\u2717") !== -1;
 }
 
-// ══ #2: ERROR KEYWORD EXTRACTION + CONTEXTUAL JOURNAL SEARCH ══
+function extractExitCode(output, metadata) {
+  if (metadata && typeof metadata.exit !== "undefined") return metadata.exit;
+  if (!output) return null;
+  var s = String(output);
+  var m = s.match(/exit code:?\s*(\d+)/i) || s.match(/EXIT:(\d+)/);
+  return m ? parseInt(m[1]) : null;
+}
+
+function extractTestResult(output) {
+  if (!output || typeof output !== "string") return null;
+  var m = output.match(/(\d+)\s*(passed|tests?\s*passed|test[s]?\s*passing)/i);
+  if (m) return m[1] + " passed";
+  m = output.match(/(\d+)\s*(failed|failing|errors?)/i);
+  if (m) return m[1] + " failed";
+  return null;
+}
+
+function extractFilePath(args) {
+  if (!args) return null;
+  return args.filePath || args.path || args.file || null;
+}
+
+// ══ ERROR KEYWORD EXTRACTION + JOURNAL SEARCH ══
 function extractErrorKeywords(output) {
   if (!output) return null;
   var lower = output.toLowerCase();
   var kws = [];
-  var patterns = ["auth","token","key","permission","denied","connection","timeout","refused",
-    "module","import","not found","no such","syntax","unexpected","invalid","type","attribute",
-    "null","undefined","ошибк","отказ","недоступ","не найден","endpoint","api","config","format"];
+  var patterns = ["auth","token","permission","denied","connection","timeout","refused",
+    "module","import","not found","syntax","invalid","type error","attribute",
+    "null","undefined","endpoint","format"];
   for (var i = 0; i < patterns.length && kws.length < 4; i++) {
     if (lower.indexOf(patterns[i]) !== -1) kws.push(patterns[i]);
   }
@@ -107,59 +184,41 @@ function searchJournal(keywords) {
   } catch (e) { return null; }
 }
 
-// ══ DISCIPLINE PROMPT (Rules 1-10, evidence-cited self-assessment) ══
+// ══ DISCIPLINE PROMPT (base: R1-5, R10. No R6-R9, no self-rating) ══
 var DISCIPLINE_PROMPT = [
   "<fablize-discipline — ENFORCED EXECUTION DISCIPLINE>",
-  "These rules are INJECTED by the fablize-opencode plugin. Not optional.",
+  "Not optional. Violating them produces incorrect work.",
   "",
   "## Rule 1 — Verification grounding",
   "Before \"done\": run code, show output, cite cells. FORBIDDEN: \"should work\", \"I assume\".",
   "",
-  "## Rule 2 — Completion gate + evidence-cited self-assessment",
+  "## Rule 2 — Multi-story completion gate",
   "For 2+ steps: decompose, evidence per step, refuse groundless \"done\".",
-  "Before \"done\", self-rate WITH EVIDENCE (cannot cite → rating = 0):",
-  "  R1: [cite which tool output verifies] ___/10",
-  "  R6: [cite which Python command you ran] ___/10",
-  "  R7: [show a step reference from your output] ___/10",
-  "  R8: [show a number with units from your output] ___/10",
-  "If ANY rating < 8: fix before done. State ratings explicitly.",
+  "The plugin checks your tool history PROGRAMMATICALLY: if you wrote/edited a file but did",
+  "NOT run a verification command (test/lint/typecheck) afterward, 'done' will be BLOCKED.",
+  "Self-rating is replaced by this automatic check — you cannot bypass it by claiming high scores.",
   "",
   "## Rule 3 — Systematic investigation",
-  "Reproduce → 2+ hypotheses → confirming/refuting evidence → causal chain end-to-end.",
-  "\"Probably X\" without chain = NOT a diagnosis.",
+  "Reproduce → 2+ hypotheses → evidence per hypothesis → causal chain end-to-end.",
   "",
   "## Rule 4 — Early-stop prevention",
-  "REFUSE: \"I'll do X\" without doing NOW. \"Should work\" without running. \"Done!\" without evidence.",
-  "If impossible: say \"BLOCKED: reason\". Never paper over.",
+  "REFUSE: \"I'll do X\" without doing NOW. \"Should work\" without running. If impossible: \"BLOCKED: reason\".",
   "",
   "## Rule 5 — Journal update",
   "After non-trivial tasks: append to /root/.config/opencode/agent-journal.md.",
   "",
-  "## Rule 6 — No mental math",
-  "Numbers > 100 in arithmetic: ALWAYS run Python. Mental math for money is FORBIDDEN.",
-  "",
-  "## Rule 7 — Step references",
-  "Cite numbers with source: \"as computed in step 3 (ledger #3: sum=787)\".",
-  "",
-  "## Rule 8 — Always state units",
-  "EVERY number MUST have units: '452 000 тыс. руб. (= 452.0 млн руб.)'.",
-  "",
-  "## Rule 9 — Show conversion formulas",
-  "When converting: '452 000 / 1000 = 452.0 млн'. Never bare converted value.",
-  "",
-  "## Rule 10 — Persistence before BLOCKED (NEW)",
-  "Before writing BLOCKED: try at least 2 different approaches.",
-  "Document what you tried and why each failed. BLOCKED only after genuine exhaustion.",
+  "## Rule 10 — Persistence before BLOCKED",
+  "Try at least 2 different approaches. Document what you tried. BLOCKED only after genuine exhaustion.",
   "",
   "## Evidence ledger",
-  "Every tool call tracked below. Empty ledger + \"done\" = Rule 1 violation.",
+  "Every tool call tracked with exit codes and test results. Empty ledger + \"done\" = blocked.",
   "",
   "## Escalation",
-  "Capability ceiling exists. When hit: NAME it, escalate. Do not pretend.",
+  "Capability ceiling exists. When hit: NAME it, escalate.",
   "</fablize-discipline>"
 ].join("\n");
 
-var DISCIPLINE_SHORT = "<fablize-active> Verify+evidence before done (R1) | Self-rate R1/R6/R7/R8 with citations (R2) | No mental math >100 (R6) | 2+ hypotheses (R3) | No empty promises (R4) | Try 2+ approaches before BLOCKED (R10) | Journal (R5) | Step refs (R7) | Units always (R8) | Show conversions (R9). Ledger below. </fablize-active>";
+var DISCIPLINE_SHORT = "<fablize-active> Verify before done (R1) | Completion auto-gated: write→must verify (R2) | 2+ hypotheses (R3) | No empty promises (R4) | Journal (R5) | Try 2+ before BLOCKED (R10). Financial rules (R6-R9) in task prompt. Ledger below. </fablize-active>";
 
 // ══ LEDGER ══
 var ledgers = new Map();
@@ -176,13 +235,16 @@ function getLedgerSummary(sessionID) {
   if (!sessionID) return "";
   var entries = ledgers.get(sessionID);
   if (!entries || entries.length === 0)
-    return "\n\n--- EVIDENCE LEDGER: empty. Claiming 'done' = Rule 1 violation. ---";
+    return "\n\n--- EVIDENCE LEDGER: empty. 'done' without tool calls = blocked. ---";
   var startIdx = Math.max(0, entries.length - RECENT_WINDOW);
   var recent = entries.slice(startIdx);
   var lines = [];
   for (var i = 0; i < recent.length; i++) {
     var e = recent[i];
     var line = (startIdx + i + 1) + ". [" + e.tool + "] " + e.title;
+    if (e.exitCode !== null && e.exitCode !== undefined) line += " → exit " + e.exitCode;
+    if (e.testResult) line += ", " + e.testResult;
+    else if (e.filePath) line += " → " + e.filePath;
     if (e.keyNumbers && e.keyNumbers.length > 0) line += " | " + e.keyNumbers.join(", ");
     if (e.hasError) line += " [ERROR]";
     lines.push(line);
@@ -192,14 +254,7 @@ function getLedgerSummary(sessionID) {
     lines.join("\n") + "\n--- END LEDGER ---";
 }
 
-// ══ JOURNAL + STATE ══
-var journalInjected = new Set();
-var fullPromptInjected = new Set();
-var pendingLazyWarning = null;
-var currentTaskMode = "default";
-var previousTaskMode = "default";
-var pendingJournalSearch = null;
-
+// ══ JOURNAL ══
 function readLastJournalEntries(count) {
   try {
     var content = readFileSync(JOURNAL_PATH, "utf-8");
@@ -219,46 +274,53 @@ var fablizePlugin = async function (_input) {
 
     "experimental.chat.system.transform": async function (input, output) {
       var sessionID = input.sessionID;
+      lastSessionID = sessionID;
+      var state = stateOf(sessionID);
       var parts = [];
 
       // Two-tier prompt
-      if (!fullPromptInjected.has(sessionID)) {
-        fullPromptInjected.add(sessionID);
+      if (!state.fullPromptInjected) {
+        state.fullPromptInjected = true;
         parts.push(DISCIPLINE_PROMPT);
-        // Task prompt on first call
-        var tp = getTaskPrompt(currentTaskMode);
+        var tp = getTaskPrompt(state.currentTaskMode);
         if (tp) parts.push("\n" + tp);
+        if (needsFinancialRules(state.currentTaskMode)) parts.push("\n" + FINANCIAL_RULES);
       } else {
         parts.push(DISCIPLINE_SHORT);
-        // #1: Dynamic task mode — inject if mode CHANGED since last call
-        if (currentTaskMode !== previousTaskMode) {
-          var newTp = getTaskPrompt(currentTaskMode);
+        if (state.currentTaskMode !== state.previousTaskMode) {
+          var newTp = getTaskPrompt(state.currentTaskMode);
           if (newTp) parts.push("\n" + newTp);
+          if (needsFinancialRules(state.currentTaskMode)) parts.push("\n" + FINANCIAL_RULES);
         }
       }
-      previousTaskMode = currentTaskMode;
+      state.previousTaskMode = state.currentTaskMode;
+
+      // Completion gate (Fix 2)
+      if (state.pendingCompletionBlock) {
+        parts.push("\n--- " + state.pendingCompletionBlock + " ---\n");
+        state.pendingCompletionBlock = null;
+      }
 
       // Anti-laziness
-      if (pendingLazyWarning) {
+      if (state.pendingLazyWarning) {
         parts.push("\n--- ANTI-LAZINESS ALERT ---");
-        parts.push("Previous response promised: \"" + pendingLazyWarning + "\" without executing.");
+        parts.push("Previous response promised: \"" + state.pendingLazyWarning + "\" without executing.");
         parts.push("DO IT NOW or state BLOCKED: <reason>.\n");
-        pendingLazyWarning = null;
+        state.pendingLazyWarning = null;
       }
 
-      // #2: Contextual journal search on errors
-      if (pendingJournalSearch) {
-        var jMatches = searchJournal(pendingJournalSearch);
+      // Contextual journal search
+      if (state.pendingJournalSearch) {
+        var jMatches = searchJournal(state.pendingJournalSearch);
         if (jMatches) {
-          parts.push("\n--- JOURNAL MATCH (error context) ---");
-          parts.push("Relevant past lessons for current error:\n" + jMatches + "\n");
+          parts.push("\n--- JOURNAL MATCH (error context) ---\n" + jMatches + "\n");
         }
-        pendingJournalSearch = null;
+        state.pendingJournalSearch = null;
       }
 
       // Journal (first call only)
-      if (!journalInjected.has(sessionID)) {
-        journalInjected.add(sessionID);
+      if (!state.journalInjected) {
+        state.journalInjected = true;
         var entries = readLastJournalEntries(JOURNAL_MAX_ENTRIES);
         if (entries) {
           parts.push("\n<agent-journal — LAST " + JOURNAL_MAX_ENTRIES + " ENTRIES>");
@@ -272,12 +334,15 @@ var fablizePlugin = async function (_input) {
     },
 
     "chat.params": async function (input, output) {
+      var sessionID = input.sessionID || lastSessionID;
+      if (sessionID) { lastSessionID = sessionID; var s = stateOf(sessionID); }
       var msgText = "";
       if (input.message) {
         msgText = input.message.text || input.message.content || "";
         if (typeof msgText !== "string") msgText = JSON.stringify(msgText) || "";
       }
-      currentTaskMode = detectTaskMode(msgText);
+      var mode = detectTaskMode(msgText);
+      if (sessionID) stateOf(sessionID).currentTaskMode = mode;
 
       var tempMap = {
         "creative":{temp:0.7,effort:"high"},"audit":{temp:0.1,effort:"max"},
@@ -286,21 +351,28 @@ var fablizePlugin = async function (_input) {
         "financial_hypothesis":{temp:0.6,effort:"max"},"financial_general":{temp:0.2,effort:"max"},
         "default":{temp:0.3,effort:"max"}
       };
-      var s = tempMap[currentTaskMode] || tempMap["default"];
-      output.temperature = s.temp;
+      var settings = tempMap[mode] || tempMap["default"];
+      output.temperature = settings.temp;
       output.options = output.options || {};
-      output.options.reasoning_effort = s.effort;
+      output.options.reasoning_effort = settings.effort;
       if (!output.maxOutputTokens || output.maxOutputTokens < 8192) output.maxOutputTokens = 8192;
     },
 
-    "experimental.chat.messages.transform": async function (_input, output) {
+    "experimental.chat.messages.transform": async function (_input, msgOutput) {
       try {
-        if (!output || !output.messages || output.messages.length === 0) return;
-        pendingLazyWarning = null;
-        for (var i = output.messages.length - 1; i >= 0; i--) {
-          var msg = output.messages[i];
+        if (!msgOutput || !msgOutput.messages || msgOutput.messages.length === 0) return;
+        var sessionID = lastSessionID;
+        if (!sessionID) return;
+        var state = stateOf(sessionID);
+        state.pendingLazyWarning = null;
+        state.pendingCompletionBlock = null;
+
+        // Find last assistant message
+        for (var i = msgOutput.messages.length - 1; i >= 0; i--) {
+          var msg = msgOutput.messages[i];
           var isAssistant = msg.info && (msg.info.role === "assistant" || msg.info.roleID === "assistant");
           if (!isAssistant) continue;
+
           var fullText = "", hasToolCall = false;
           if (msg.parts) {
             for (var j = 0; j < msg.parts.length; j++) {
@@ -309,28 +381,45 @@ var fablizePlugin = async function (_input) {
               if (part.type === "tool" || part.type === "tool_use" || part.type === "tool_call" || part.tool) hasToolCall = true;
             }
           }
-          if (!hasToolCall) { var lm = detectLaziness(fullText); if (lm) pendingLazyWarning = lm; }
+
+          // FIX 2: Programmatic completion gate
+          var ledger = ledgers.get(sessionID) || [];
+          var completionBlock = checkCompletionGate(fullText, ledger);
+          if (completionBlock) {
+            state.pendingCompletionBlock = completionBlock;
+          } else if (!hasToolCall) {
+            var lazyMatch = detectLaziness(fullText);
+            if (lazyMatch) state.pendingLazyWarning = lazyMatch;
+          }
           break;
         }
       } catch (e) {}
     },
 
     "tool.execute.after": async function (input, output) {
+      var sessionID = input.sessionID;
+      lastSessionID = sessionID;
       var outStr = "";
+      var metadata = output && output.metadata ? output.metadata : {};
       if (output && output.output)
         outStr = typeof output.output === "string" ? output.output : JSON.stringify(output.output);
+
       var errorFlag = hasError(outStr);
-      recordEvidence(input.sessionID, {
-        tool: input.tool, callID: input.callID,
+      recordEvidence(sessionID, {
+        tool: input.tool,
+        callID: input.callID,
         title: (output && output.title) ? output.title : "(" + input.tool + ")",
         timestamp: Date.now(),
         keyNumbers: extractKeyNumbers(outStr),
         hasError: errorFlag,
+        exitCode: extractExitCode(outStr, metadata),
+        testResult: extractTestResult(outStr),
+        filePath: extractFilePath(input.args),
       });
-      // #2: Trigger contextual journal search on error
+
       if (errorFlag) {
         var errorKws = extractErrorKeywords(outStr);
-        if (errorKws) pendingJournalSearch = errorKws;
+        if (errorKws) stateOf(sessionID).pendingJournalSearch = errorKws;
       }
     },
 
