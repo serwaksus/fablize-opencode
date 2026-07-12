@@ -642,15 +642,15 @@ var fablizePlugin = async function (_input) {
       }
 
       // ══ v1.2: /fablize COMMAND DETECTION ══
-      var fabCmd = msgText.match(/^\/fablize\s+(\w+)/i);
+      var fabCmd = msgText.match(/^\/fablize(?:\s+(\w+))?/i);
       if (fabCmd) {
-        var cmd = fabCmd[1].toLowerCase();
+        var cmd = (fabCmd[1] || "status").toLowerCase();
         if (sessionID) {
           var fst = stateOf(sessionID);
           if (cmd === "off") { fst.fablizeMode = "off"; fst.fablizeStatusRequested = true; }
           else if (cmd === "lite") { fst.fablizeMode = "lite"; fst.fablizeStatusRequested = true; }
           else if (cmd === "full") { fst.fablizeMode = "full"; fst.fablizeStatusRequested = true; }
-          else if (cmd === "status") { fst.fablizeStatusRequested = true; }
+          else { fst.fablizeStatusRequested = true; } // status or unknown → show status
         }
         // Do NOT run task mode detection or change model settings for /fablize commands
         return;
