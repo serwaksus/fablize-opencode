@@ -46,7 +46,12 @@ function stateOf(sessionID) {
       reviewRequested: false,
       reviewEvidenceSeen: false,
       reviewDone: false,
+      verificationRecoveryRequired: false,
+      verificationFailureSummary: null,
+      verificationFailureAttempts: 0,
       writtenFiles: [],
+      fablizeMode: "full",
+      fablizeStatusRequested: false,
     });
   }
   var state = sessionState.get(sessionID);
@@ -153,6 +158,18 @@ var DIFF_REVIEW_PROMPT = [
   "- Scope creep beyond stated goal",
   "For every finding cite file and line. Do NOT modify code in this pass.",
   "If no issues: state 'No actionable finding after diff review.'"
+].join("\n");
+
+// ══ v1.1: VERIFICATION RECOVERY PROMPT ══
+var RECOVERY_PROMPT = [
+  "--- VERIFICATION FAILED — RECOVERY REQUIRED ---",
+  "A relevant check failed after your changes.",
+  "Do not claim completion.",
+  "Read the exact failure output from the evidence ledger.",
+  "State at least two plausible causes.",
+  "Make the smallest justified correction and rerun the failing check.",
+  "If the issue remains after two genuine repair attempts,",
+  "report UNRESOLVED with the blocker and evidence."
 ].join("\n");
 
 // ══ CONDITIONAL DETECTION HELPERS ══
@@ -277,6 +294,47 @@ function extractTestResult(output) {
   return m ? m[1] + " failed" : null;
 }
 
+// ══ v1.1: VERIFICATION FAILURE SUMMARY ══
+function extractFailureSummary(command, output, exitCode) {
+  var lines = (output || "").split("\n");
+  var keyLines = [];
+  for (var i = 0; i < lines.length && keyLines.length < 5; i++) {
+    var l = lines[i].trim();
+    if (!l) continue;
+    if (/^(FAILED|ERROR|Traceback|AssertionError|E\s|FAILED|FAIL\b)/i.test(l) ||
+        /\d+\s*(failed|error|failing)\b/i.test(l)) {
+      keyLines.push(l.substring(0, 120));
+    }
+  }
+  return (command || "").substring(0, 80) + " → exit " + (exitCode != null ? exitCode : "?") +
+    (keyLines.length > 0 ? " | " + keyLines.join(" / ") : "");
+}
+
+function hasTestFailures(output, exitCode) {
+  if (exitCode != null && exitCode !== 0) return true;
+  if (!output) return false;
+  var s = String(output);
+  // Look for "N failed" where N > 0
+  var m = s.match(/(\d+)\s*(failed|failing)\b/i);
+  if (m && parseInt(m[1]) > 0) return true;
+  // Look for FAILED test markers
+  if (/^FAILED\b/m.test(s)) return true;
+  return false;
+}
+
+function hasGenuinePass(output, exitCode) {
+  if (exitCode != null && exitCode !== 0) return false;
+  if (!output) return true; // exit 0, no output → assume pass
+  var s = String(output);
+  // Check no "N failed" with N > 0
+  var m = s.match(/(\d+)\s*(failed|failing)\b/i);
+  if (m && parseInt(m[1]) > 0) return false;
+  if (/^FAILED\b/m.test(s)) return false;
+  // Check for error indicators
+  if (/\b(traceback|exception|fatal error)\b/i.test(s)) return false;
+  return true;
+}
+
 function extractFilePath(args) { return args ? (args.filePath || args.path || args.file || null) : null; }
 
 // ══ JOURNAL + INVARIANTS ══
@@ -377,6 +435,16 @@ var DISCIPLINE_PROMPT = [
 
 var DISCIPLINE_SHORT = "<fablize-active> Verify before done (R1) | Write→relevant verify (R2) | 2+ hypotheses (R3) | No unsupported claims (R4) | Journal (R5) | Try 2+ not for destructive ops (R10). Financial R6-R9 in task prompt. </fablize-active>";
 
+// ══ v1.2: LITE MODE PROMPTS ══
+var LITE_PROMPT = [
+  "<fablize-lite>",
+  "Before reporting done: run a relevant check (test/lint/typecheck).",
+  "If a check fails: investigate the failure, fix, and rerun. Do not claim done with failing tests.",
+  "Run `git diff --check` before your final response.",
+  "</fablize-lite>"
+].join("\n");
+var LITE_SHORT = "<fablize-lite> Verify before done | Recovery on failed check | git diff --check before done </fablize-lite>";
+
 // ══ LEDGER FUNCTIONS ══
 function recordEvidence(sessionID, entry) {
   if (!ledgers.has(sessionID)) ledgers.set(sessionID, []);
@@ -439,7 +507,57 @@ var fablizePlugin = async function (_input) {
     "experimental.chat.system.transform": async function (input, output) {
       var sessionID = input.sessionID;
       var state = stateOf(sessionID);
+
+      // ══ v1.2: MODE DISPATCH ══
+
+      // OFF: completely silent
+      if (state.fablizeMode === "off") {
+        if (state.fablizeStatusRequested) {
+          state.fablizeStatusRequested = false;
+          output.system.push("[fablize] Mode: OFF — all discipline disabled.");
+        }
+        return;
+      }
+
+      // STATUS: show current mode + features
+      if (state.fablizeStatusRequested) {
+        state.fablizeStatusRequested = false;
+        var features = state.fablizeMode === "full"
+          ? "completion gate: ON | recovery: ON | diff review: ON | blind-spot: ON | plan: ON | journal: ON | model settings: adjusted"
+          : state.fablizeMode === "lite"
+            ? "completion gate: ON | recovery: ON | diff review: OFF | blind-spot: OFF | plan: OFF | journal: OFF | model settings: unchanged"
+            : "all features OFF";
+        output.system.push("[fablize] Mode: " + state.fablizeMode.toUpperCase() + " — " + features);
+        if (state.fablizeMode === "off") return;
+      }
+
       var parts = [];
+
+      // LITE: minimal prompt, no blind-spot/plan/invariants/journal/ledger
+      if (state.fablizeMode === "lite") {
+        if (!state.fullPromptInjected) {
+          state.fullPromptInjected = true;
+          parts.push(LITE_PROMPT);
+        } else {
+          parts.push(LITE_SHORT);
+        }
+        // Recovery injection (lite includes recovery)
+        if (state.verificationRecoveryRequired) {
+          parts.push("\n" + RECOVERY_PROMPT);
+          if (state.verificationFailureSummary) {
+            parts.push("\nLast failure: " + state.verificationFailureSummary);
+          }
+        }
+        // Completion block (lite includes completion gate)
+        if (state.pendingCompletionBlock) {
+          parts.push("\n--- " + state.pendingCompletionBlock + " ---\n");
+          state.pendingCompletionBlock = null;
+        }
+        output.system.push(parts.join("\n"));
+        return;
+      }
+
+      // FULL: original behavior below
 
       // Two-tier prompt
       if (!state.fullPromptInjected) {
@@ -500,6 +618,17 @@ var fablizePlugin = async function (_input) {
         state.pendingJournalSearch = null;
       }
 
+      // ══ v1.1: VERIFICATION RECOVERY INJECTION ══
+      if (state.verificationRecoveryRequired) {
+        parts.push("\n" + RECOVERY_PROMPT);
+        if (state.verificationFailureAttempts >= 2) {
+          parts.push("\n⚠ You have made " + state.verificationFailureAttempts + " repair attempts. If this check still fails, report UNRESOLVED with the blocker and evidence.");
+        }
+        if (state.verificationFailureSummary) {
+          parts.push("\nLast failure: " + state.verificationFailureSummary);
+        }
+      }
+
       parts.push(getLedgerSummary(sessionID));
       output.system.push(parts.join("\n"));
     },
@@ -511,9 +640,31 @@ var fablizePlugin = async function (_input) {
         msgText = input.message.text || input.message.content || "";
         if (typeof msgText !== "string") msgText = JSON.stringify(msgText) || "";
       }
+
+      // ══ v1.2: /fablize COMMAND DETECTION ══
+      var fabCmd = msgText.match(/^\/fablize\s+(\w+)/i);
+      if (fabCmd) {
+        var cmd = fabCmd[1].toLowerCase();
+        if (sessionID) {
+          var fst = stateOf(sessionID);
+          if (cmd === "off") { fst.fablizeMode = "off"; fst.fablizeStatusRequested = true; }
+          else if (cmd === "lite") { fst.fablizeMode = "lite"; fst.fablizeStatusRequested = true; }
+          else if (cmd === "full") { fst.fablizeMode = "full"; fst.fablizeStatusRequested = true; }
+          else if (cmd === "status") { fst.fablizeStatusRequested = true; }
+        }
+        // Do NOT run task mode detection or change model settings for /fablize commands
+        return;
+      }
+
       var mode = detectTaskMode(msgText);
       if (sessionID) {
         var st = stateOf(sessionID);
+        // ══ v1.2: Skip model settings in off/lite modes ══
+        if (st.fablizeMode === "off" || st.fablizeMode === "lite") {
+          st.currentTaskMode = mode;
+          st.isRisky = st.isRisky || detectRisky(msgText);
+          return;
+        }
         st.currentTaskMode = mode;
         st.isRisky = st.isRisky || detectRisky(msgText);
       }
@@ -546,6 +697,10 @@ var fablizePlugin = async function (_input) {
         }
 
         var state = stateOf(sessionID);
+
+        // ══ v1.2: OFF mode — skip entirely ══
+        if (state.fablizeMode === "off") return;
+
         state.pendingWarning = null;
         state.pendingCompletionBlock = null;
 
@@ -564,7 +719,20 @@ var fablizePlugin = async function (_input) {
 
           var ledger = ledgers.get(sessionID) || [];
 
-          // Track: blind-spot completed?
+          // ══ v1.2: LITE mode — completion gate + recovery only, skip blind-spot/plan/review ══
+          if (state.fablizeMode === "lite") {
+            if (DONE_PATTERNS.some(function(re) { return re.test(fullText); })) {
+              if (state.verificationRecoveryRequired) {
+                state.pendingCompletionBlock = "VERIFICATION RECOVERY REQUIRED: A check failed and must be fixed before completion.";
+                break;
+              }
+              var liteBlock = checkCompletionGate(fullText, ledger, state.currentTaskMode);
+              if (liteBlock) state.pendingCompletionBlock = liteBlock;
+            }
+            break;
+          }
+
+          // FULL mode: blind-spot/plan/review tracking below
           if (state.blindSpotRequested && !state.blindSpotDone && hasBlindSpotCompletion(fullText)) {
             state.blindSpotDone = true;
           }
@@ -588,6 +756,11 @@ var fablizePlugin = async function (_input) {
           }
 
           if (DONE_PATTERNS.some(function(re) { return re.test(fullText); })) {
+            // ══ v1.1: Block completion if verification recovery is required ══
+            if (state.verificationRecoveryRequired) {
+              state.pendingCompletionBlock = "VERIFICATION RECOVERY REQUIRED: A check failed and must be fixed before completion. Do not claim 'done'. Investigate the failure in the evidence ledger, form 2+ hypotheses, fix, and rerun the failing check.";
+              break;
+            }
             var writeInfo = countWritesInLedger(ledger);
             var needsReview = (writeInfo.unique >= 3 || hasRiskyFileChange(ledger)) && !state.reviewRequested;
             if (needsReview) {
@@ -617,6 +790,11 @@ var fablizePlugin = async function (_input) {
 
     "tool.execute.after": async function (input, output) {
       var sessionID = input.sessionID;
+      var state = stateOf(sessionID);
+
+      // ══ v1.2: OFF mode — skip entirely ══
+      if (state.fablizeMode === "off") return;
+
       var outStr = "";
       var metadata = output && output.metadata ? output.metadata : {};
       if (output && output.output) outStr = typeof output.output === "string" ? output.output : JSON.stringify(output.output);
@@ -634,7 +812,27 @@ var fablizePlugin = async function (_input) {
         isVerification: input.tool === "bash" ? isVerificationCommand(command) : false,
       });
 
-      // Track written files
+      // ══ v1.2: LITE mode — evidence + recovery only, skip blind-spot/plan/journal ══
+      if (state.fablizeMode === "lite") {
+        // Track written files (needed for completion gate)
+        if ((input.tool === "write" || input.tool === "edit") && filePath) {
+          if (state.writtenFiles.indexOf(filePath) === -1) state.writtenFiles.push(filePath);
+        }
+        // Recovery tracking
+        if (input.tool === "bash" && isVerificationCommand(command)) {
+          if (hasTestFailures(outStr, exitCode)) {
+            state.verificationRecoveryRequired = true;
+            state.verificationFailureAttempts++;
+            state.verificationFailureSummary = extractFailureSummary(command, outStr, exitCode);
+          } else if (hasGenuinePass(outStr, exitCode)) {
+            state.verificationRecoveryRequired = false;
+            state.verificationFailureSummary = null;
+          }
+        }
+        return;
+      }
+
+      // FULL mode: blind-spot/plan/journal tracking below
       if ((input.tool === "write" || input.tool === "edit") && filePath) {
         var st = stateOf(sessionID);
         if (st.writtenFiles.indexOf(filePath) === -1) st.writtenFiles.push(filePath);
@@ -653,6 +851,22 @@ var fablizePlugin = async function (_input) {
         var errorKws = extractErrorKeywords(outStr);
         if (errorKws) stateOf(sessionID).pendingJournalSearch = errorKws;
       }
+
+      // ══ v1.1: VERIFICATION RECOVERY TRACKING ══
+      if (input.tool === "bash" && isVerificationCommand(command)) {
+        var vState = stateOf(sessionID);
+        if (hasTestFailures(outStr, exitCode)) {
+          // Verification failed — set recovery state
+          vState.verificationRecoveryRequired = true;
+          vState.verificationFailureAttempts++;
+          vState.verificationFailureSummary = extractFailureSummary(command, outStr, exitCode);
+        } else if (hasGenuinePass(outStr, exitCode)) {
+          // Verification genuinely passed — clear recovery state
+          vState.verificationRecoveryRequired = false;
+          vState.verificationFailureSummary = null;
+        }
+        // If neither (ambiguous output), leave state unchanged
+      }
     },
 
     // ══ #5: COMPACTION MEMORY — preserve fablize state across context compression ══
@@ -660,8 +874,37 @@ var fablizePlugin = async function (_input) {
       try {
         var sessionID = input.sessionID;
         var state = stateOf(sessionID);
+
+        // ══ v1.2: OFF mode — minimal note ══
+        if (state.fablizeMode === "off") {
+          output.context.push("FABLIZE: off (no discipline active)");
+          return;
+        }
+
         var ledger = ledgers.get(sessionID) || [];
         var writeInfo = countWritesInLedger(ledger);
+
+        // ══ v1.2: LITE mode — recovery + verification only ══
+        if (state.fablizeMode === "lite") {
+          var liteLines = ["FABLIZE LITE STATE"];
+          if (state.writtenFiles && state.writtenFiles.length > 0) {
+            liteLines.push("Files changed: " + state.writtenFiles.join(", "));
+          }
+          var liteLastVerify = null;
+          for (var li = ledger.length - 1; li >= 0; li--) {
+            if (ledger[li].isVerification) {
+              liteLastVerify = ledger[li].command + " → exit " + ledger[li].exitCode +
+                (ledger[li].testResult ? ", " + ledger[li].testResult : "");
+              break;
+            }
+          }
+          liteLines.push("Last verification: " + (liteLastVerify || "none"));
+          liteLines.push("Recovery required: " + (state.verificationRecoveryRequired ? "yes (attempts: " + state.verificationFailureAttempts + ")" : "no"));
+          output.context.push(liteLines.join("\n"));
+          return;
+        }
+
+        // FULL mode: detailed state below
 
         // Build compact continuation state from session data
         var lines = ["FABLIZE CONTINUATION STATE"];
@@ -699,6 +942,16 @@ var fablizePlugin = async function (_input) {
           }
         }
         lines.push("Last verification: " + (lastVerify || "none"));
+
+        // ══ v1.1: Recovery status ══
+        if (state.verificationRecoveryRequired) {
+          lines.push("Recovery required: yes (attempts: " + state.verificationFailureAttempts + ")");
+          if (state.verificationFailureSummary) {
+            lines.push("Last failure: " + state.verificationFailureSummary.substring(0, 100));
+          }
+        } else {
+          lines.push("Recovery required: no");
+        }
 
         // Review status
         if (state.reviewRequested) {
