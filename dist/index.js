@@ -25,6 +25,7 @@ function cleanupSessions() {
 }
 
 function stateOf(sessionID) {
+  if (typeof sessionID !== "string" || !sessionID.trim()) return null;
   cleanupSessions();
   if (!sessionState.has(sessionID)) {
     sessionState.set(sessionID, {
@@ -34,6 +35,7 @@ function stateOf(sessionID) {
       pendingJournalSearch: null,
       pendingCompletionBlock: null,
       fullPromptInjected: false,
+      litePromptInjected: false,
       lastSeenAt: Date.now(),
       blindSpotRequested: false,
       blindSpotDone: false,
@@ -49,7 +51,9 @@ function stateOf(sessionID) {
       verificationRecoveryRequired: false,
       verificationFailureSummary: null,
       verificationFailureAttempts: 0,
+      verificationFailedCommand: null,
       writtenFiles: [],
+      hasWritesSinceLastVerify: false,
       fablizeMode: "full",
       fablizeStatusRequested: false,
     });
@@ -57,6 +61,25 @@ function stateOf(sessionID) {
   var state = sessionState.get(sessionID);
   state.lastSeenAt = Date.now();
   return state;
+}
+
+// ══ v1.3: MODE TRANSITION — reset gates/recovery/flags on mode switch ══
+function setFablizeMode(state, sessionID, nextMode) {
+  if (!state || state.fablizeMode === nextMode) return;
+  state.fablizeMode = nextMode;
+  state.fullPromptInjected = false;
+  state.litePromptInjected = false;
+  state.pendingCompletionBlock = null;
+  state.pendingWarning = null;
+  state.pendingJournalSearch = null;
+  state.reviewRequested = false;
+  state.reviewEvidenceSeen = false;
+  state.reviewDone = false;
+  state.verificationRecoveryRequired = false;
+  state.verificationFailureSummary = null;
+  state.verificationFailureAttempts = 0;
+  state.verificationFailedCommand = null;
+  state.hasWritesSinceLastVerify = false;
 }
 
 // ══ TASK MODE DETECTION ══
@@ -280,10 +303,16 @@ function hasError(output, exitCode) {
 }
 
 function extractExitCode(output, metadata) {
-  if (metadata && typeof metadata.exit !== "undefined") return metadata.exit;
-  if (!output) return null;
-  var m = String(output).match(/exit code:?\s*(\d+)/i) || String(output).match(/EXIT:(\d+)/);
-  return m ? parseInt(m[1]) : null;
+  var raw = null;
+  if (metadata && typeof metadata.exit !== "undefined") raw = metadata.exit;
+  else if (metadata && typeof metadata.exitCode !== "undefined") raw = metadata.exitCode;
+  else if (output) {
+    var m = String(output).match(/exit code:?\s*(\d+)/i) || String(output).match(/EXIT:(\d+)/);
+    if (m) raw = m[1];
+  }
+  if (raw === null || raw === undefined || raw === "") return null;
+  var n = Number(raw);
+  return Number.isInteger(n) ? n : null;
 }
 
 function extractTestResult(output) {
@@ -323,14 +352,13 @@ function hasTestFailures(output, exitCode) {
 }
 
 function hasGenuinePass(output, exitCode) {
-  if (exitCode != null && exitCode !== 0) return false;
-  if (!output) return true; // exit 0, no output → assume pass
+  if (exitCode === null || exitCode === undefined) return false;
+  if (exitCode !== 0) return false;
+  if (!output) return true;
   var s = String(output);
-  // Check no "N failed" with N > 0
   var m = s.match(/(\d+)\s*(failed|failing)\b/i);
   if (m && parseInt(m[1]) > 0) return false;
   if (/^FAILED\b/m.test(s)) return false;
-  // Check for error indicators
   if (/\b(traceback|exception|fatal error)\b/i.test(s)) return false;
   return true;
 }
@@ -507,6 +535,7 @@ var fablizePlugin = async function (_input) {
     "experimental.chat.system.transform": async function (input, output) {
       var sessionID = input.sessionID;
       var state = stateOf(sessionID);
+      if (!state) return;
 
       // ══ v1.2: MODE DISPATCH ══
 
@@ -535,8 +564,8 @@ var fablizePlugin = async function (_input) {
 
       // LITE: minimal prompt, no blind-spot/plan/invariants/journal/ledger
       if (state.fablizeMode === "lite") {
-        if (!state.fullPromptInjected) {
-          state.fullPromptInjected = true;
+        if (!state.litePromptInjected) {
+          state.litePromptInjected = true;
           parts.push(LITE_PROMPT);
         } else {
           parts.push(LITE_SHORT);
@@ -647,9 +676,9 @@ var fablizePlugin = async function (_input) {
         var cmd = (fabCmd[1] || "status").toLowerCase();
         if (sessionID) {
           var fst = stateOf(sessionID);
-          if (cmd === "off") { fst.fablizeMode = "off"; fst.fablizeStatusRequested = true; }
-          else if (cmd === "lite") { fst.fablizeMode = "lite"; fst.fablizeStatusRequested = true; }
-          else if (cmd === "full") { fst.fablizeMode = "full"; fst.fablizeStatusRequested = true; }
+          if (cmd === "off") { setFablizeMode(fst, sessionID, "off"); fst.fablizeStatusRequested = true; }
+          else if (cmd === "lite") { setFablizeMode(fst, sessionID, "lite"); fst.fablizeStatusRequested = true; }
+          else if (cmd === "full") { setFablizeMode(fst, sessionID, "full"); fst.fablizeStatusRequested = true; }
           else { fst.fablizeStatusRequested = true; } // status or unknown → show status
         }
         // Do NOT run task mode detection or change model settings for /fablize commands
@@ -659,13 +688,14 @@ var fablizePlugin = async function (_input) {
       var mode = detectTaskMode(msgText);
       if (sessionID) {
         var st = stateOf(sessionID);
+        if (!st) return;
+        // v1.3: Don't reset to default on follow-up messages
+        if (mode !== "default") st.currentTaskMode = mode;
         // ══ v1.2: Skip model settings in off/lite modes ══
         if (st.fablizeMode === "off" || st.fablizeMode === "lite") {
-          st.currentTaskMode = mode;
           st.isRisky = st.isRisky || detectRisky(msgText);
           return;
         }
-        st.currentTaskMode = mode;
         st.isRisky = st.isRisky || detectRisky(msgText);
       }
 
@@ -697,6 +727,7 @@ var fablizePlugin = async function (_input) {
         }
 
         var state = stateOf(sessionID);
+        if (!state) return;
 
         // ══ v1.2: OFF mode — skip entirely ══
         if (state.fablizeMode === "off") return;
@@ -791,6 +822,7 @@ var fablizePlugin = async function (_input) {
     "tool.execute.after": async function (input, output) {
       var sessionID = input.sessionID;
       var state = stateOf(sessionID);
+      if (!state) return;
 
       // ══ v1.2: OFF mode — skip entirely ══
       if (state.fablizeMode === "off") return;
@@ -817,16 +849,28 @@ var fablizePlugin = async function (_input) {
         // Track written files (needed for completion gate)
         if ((input.tool === "write" || input.tool === "edit") && filePath) {
           if (state.writtenFiles.indexOf(filePath) === -1) state.writtenFiles.push(filePath);
+          state.hasWritesSinceLastVerify = true;
         }
-        // Recovery tracking
+        // Recovery tracking — v1.3: match command identity
         if (input.tool === "bash" && isVerificationCommand(command)) {
+          var normCmd = command.replace(/\s+/g, " ").trim().toLowerCase();
           if (hasTestFailures(outStr, exitCode)) {
+            if (state.verificationFailedCommand && state.verificationFailedCommand === normCmd && state.hasWritesSinceLastVerify) {
+              state.verificationFailureAttempts++;
+            } else {
+              state.verificationFailureAttempts = 1;
+            }
             state.verificationRecoveryRequired = true;
-            state.verificationFailureAttempts++;
             state.verificationFailureSummary = extractFailureSummary(command, outStr, exitCode);
+            state.verificationFailedCommand = normCmd;
+            state.hasWritesSinceLastVerify = false;
           } else if (hasGenuinePass(outStr, exitCode)) {
-            state.verificationRecoveryRequired = false;
-            state.verificationFailureSummary = null;
+            if (!state.verificationFailedCommand || state.verificationFailedCommand === normCmd) {
+              state.verificationRecoveryRequired = false;
+              state.verificationFailureSummary = null;
+              state.verificationFailureAttempts = 0;
+              state.verificationFailedCommand = null;
+            }
           }
         }
         return;
@@ -835,7 +879,9 @@ var fablizePlugin = async function (_input) {
       // FULL mode: blind-spot/plan/journal tracking below
       if ((input.tool === "write" || input.tool === "edit") && filePath) {
         var st = stateOf(sessionID);
+        if (!st) return;
         if (st.writtenFiles.indexOf(filePath) === -1) st.writtenFiles.push(filePath);
+        st.hasWritesSinceLastVerify = true;
         // If blind-spot was requested but not completed, mark as bypassed (not done)
         if (st.blindSpotRequested && !st.blindSpotDone) st.blindSpotBypassed = true;
         // If plan was requested but not provided, mark as bypassed
@@ -852,20 +898,29 @@ var fablizePlugin = async function (_input) {
         if (errorKws) stateOf(sessionID).pendingJournalSearch = errorKws;
       }
 
-      // ══ v1.1: VERIFICATION RECOVERY TRACKING ══
+      // ══ v1.1: VERIFICATION RECOVERY TRACKING (v1.3: command identity matching) ══
       if (input.tool === "bash" && isVerificationCommand(command)) {
         var vState = stateOf(sessionID);
+        if (!vState) return;
+        var fullNormCmd = command.replace(/\s+/g, " ").trim().toLowerCase();
         if (hasTestFailures(outStr, exitCode)) {
-          // Verification failed — set recovery state
+          if (vState.verificationFailedCommand && vState.verificationFailedCommand === fullNormCmd && vState.hasWritesSinceLastVerify) {
+            vState.verificationFailureAttempts++;
+          } else {
+            vState.verificationFailureAttempts = 1;
+          }
           vState.verificationRecoveryRequired = true;
-          vState.verificationFailureAttempts++;
           vState.verificationFailureSummary = extractFailureSummary(command, outStr, exitCode);
+          vState.verificationFailedCommand = fullNormCmd;
+          vState.hasWritesSinceLastVerify = false;
         } else if (hasGenuinePass(outStr, exitCode)) {
-          // Verification genuinely passed — clear recovery state
-          vState.verificationRecoveryRequired = false;
-          vState.verificationFailureSummary = null;
+          if (!vState.verificationFailedCommand || vState.verificationFailedCommand === fullNormCmd) {
+            vState.verificationRecoveryRequired = false;
+            vState.verificationFailureSummary = null;
+            vState.verificationFailureAttempts = 0;
+            vState.verificationFailedCommand = null;
+          }
         }
-        // If neither (ambiguous output), leave state unchanged
       }
     },
 
@@ -874,6 +929,7 @@ var fablizePlugin = async function (_input) {
       try {
         var sessionID = input.sessionID;
         var state = stateOf(sessionID);
+        if (!state) return;
 
         // ══ v1.2: OFF mode — minimal note ══
         if (state.fablizeMode === "off") {
