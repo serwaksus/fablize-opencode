@@ -56,6 +56,16 @@ function stateOf(sessionID) {
       hasWritesSinceLastVerify: false,
       fablizeMode: "full",
       fablizeStatusRequested: false,
+      // v1.4 #1: task epochs
+      taskEpoch: 0,
+      // v1.4 #2: dirty-file set (filePath → fileExt)
+      dirtyFiles: {},
+      // v1.4 #4: diff review provenance timestamps
+      lastWriteTimestamp: 0,
+      lastDiffCheckTimestamp: 0,
+      lastDiffTimestamp: 0,
+      // v1.4 #3: bypass waiver
+      bypassWaiverAcknowledged: false,
     });
   }
   var state = sessionState.get(sessionID);
@@ -91,6 +101,39 @@ function setFablizeMode(state, sessionID, nextMode) {
   state.writtenFiles = [];
 }
 
+// ══ v1.4 #1: TASK EPOCH — reset gate state for a new user task ══
+function resetTaskEpoch(state, sessionID) {
+  if (!state) return;
+  state.taskEpoch++;
+  state.pendingCompletionBlock = null;
+  state.pendingWarning = null;
+  state.pendingJournalSearch = null;
+  state.blindSpotRequested = false;
+  state.blindSpotDone = false;
+  state.blindSpotBypassed = false;
+  state.planRequested = false;
+  state.planProvided = false;
+  state.planBypassed = false;
+  state.invariantsInjected = false;
+  state.reviewRequested = false;
+  state.reviewEvidenceSeen = false;
+  state.reviewDone = false;
+  state.verificationRecoveryRequired = false;
+  state.verificationFailureSummary = null;
+  state.verificationFailureAttempts = 0;
+  state.verificationFailedCommand = null;
+  state.hasWritesSinceLastVerify = false;
+  state.isRisky = false;
+  state.writtenFiles = [];
+  state.dirtyFiles = {};
+  state.bypassWaiverAcknowledged = false;
+  state.lastWriteTimestamp = 0;
+  state.lastDiffCheckTimestamp = 0;
+  state.lastDiffTimestamp = 0;
+  // Clear ledger for this session
+  if (sessionID) ledgers.set(sessionID, []);
+}
+
 // ══ TASK MODE DETECTION ══
 var CREATIVE_KW = ["напиши текст","придумай","brainstorm","creative","сочини","слоган","стих","рассказ"];
 var AUDIT_KW = ["аудит","сверк","ebitda","дебет","кредит","сальдо","проводк","audit","reconcil"];
@@ -108,18 +151,31 @@ var RISKY_KW = ["migration","миграц","schema","схема","auth","аут�
   "sql","trading","торгов","order","ордер","payment","платёж","payment","money","деньг",
   "refactor","рефактор","architecture","архитектур"];
 
+// ══ v1.4 #5: SCORED TASK CLASSIFICATION ══
+var MODE_KEYWORDS = {
+  creative:             { kws: CREATIVE_KW, weight: 2 },
+  audit:                { kws: AUDIT_KW, weight: 3 },
+  debug:                { kws: DEBUG_KW, weight: 3 },
+  coding:               { kws: CODING_KW, weight: 2 },
+  create:               { kws: CREATE_KW, weight: 2 },
+  financial_verify:     { kws: FIN_VERIFY, weight: 3 },
+  financial_analyze:    { kws: FIN_ANALYZE, weight: 2 },
+  financial_hypothesis: { kws: FIN_HYPO, weight: 2 },
+  financial_general:    { kws: FIN_GEN, weight: 1 },
+};
+
 function detectTaskMode(text) {
   var t = (text || "").toLowerCase();
-  for (var i = 0; i < CREATIVE_KW.length; i++) if (t.indexOf(CREATIVE_KW[i]) !== -1) return "creative";
-  for (var i = 0; i < AUDIT_KW.length; i++) if (t.indexOf(AUDIT_KW[i]) !== -1) return "audit";
-  for (var i = 0; i < DEBUG_KW.length; i++) if (t.indexOf(DEBUG_KW[i]) !== -1) return "debug";
-  for (var i = 0; i < CODING_KW.length; i++) if (t.indexOf(CODING_KW[i]) !== -1) return "coding";
-  for (var i = 0; i < CREATE_KW.length; i++) if (t.indexOf(CREATE_KW[i]) !== -1) return "create";
-  for (var i = 0; i < FIN_VERIFY.length; i++) if (t.indexOf(FIN_VERIFY[i]) !== -1) return "financial_verify";
-  for (var i = 0; i < FIN_ANALYZE.length; i++) if (t.indexOf(FIN_ANALYZE[i]) !== -1) return "financial_analyze";
-  for (var i = 0; i < FIN_HYPO.length; i++) if (t.indexOf(FIN_HYPO[i]) !== -1) return "financial_hypothesis";
-  for (var i = 0; i < FIN_GEN.length; i++) if (t.indexOf(FIN_GEN[i]) !== -1) return "financial_general";
-  return "default";
+  var bestMode = "default", bestScore = 0;
+  for (var mode in MODE_KEYWORDS) {
+    var cfg = MODE_KEYWORDS[mode];
+    var score = 0;
+    for (var i = 0; i < cfg.kws.length; i++) {
+      if (t.indexOf(cfg.kws[i]) !== -1) score += cfg.weight;
+    }
+    if (score > bestScore) { bestScore = score; bestMode = mode; }
+  }
+  return bestScore >= 2 ? bestMode : "default";
 }
 
 function detectRisky(text) {
@@ -255,15 +311,42 @@ function isVerificationCommand(command) {
   return false;
 }
 
+// ══ v1.4 #2: DIRTY-FILE CLEARING ══
+function clearCoveredDirtyFiles(state, command) {
+  if (!state || !state.dirtyFiles) return;
+  var c = (command || "").toLowerCase();
+  var coveredExts = {};
+  if (/(pytest|ruff|mypy|pyright|python)/.test(c)) { coveredExts.py = 1; coveredExts.csv = 1; coveredExts.xlsx = 1; coveredExts.jsonl = 1; }
+  if (/(npm|pnpm|yarn|tsc|eslint|prettier)/.test(c)) { coveredExts.ts = 1; coveredExts.tsx = 1; coveredExts.js = 1; coveredExts.jsx = 1; coveredExts.mjs = 1; }
+  if (/go\s+(test|vet)/.test(c)) coveredExts.go = 1;
+  if (/cargo/.test(c)) coveredExts.rs = 1;
+  if (/make\s+/.test(c)) { coveredExts.py = 1; coveredExts.go = 1; coveredExts.rs = 1; coveredExts.ts = 1; coveredExts.js = 1; }
+  for (var fp in state.dirtyFiles) {
+    var ext = state.dirtyFiles[fp];
+    if (coveredExts[ext]) delete state.dirtyFiles[fp];
+  }
+}
+
+function hasDirtyFiles(state) {
+  if (!state || !state.dirtyFiles) return false;
+  return Object.keys(state.dirtyFiles).length > 0;
+}
+
 // ══ COMPLETION GATE ══
 var WORK_MODES = ["create","debug","coding","audit","financial_verify","financial_analyze","financial_hypothesis","financial_general"];
 
-function checkCompletionGate(text, ledger, taskMode) {
+function checkCompletionGate(text, ledger, taskMode, state) {
   if (!text) return null;
   if (!DONE_PATTERNS.some(function(re) { return re.test(text); })) return null;
   if ((!ledger || ledger.length === 0) && WORK_MODES.indexOf(taskMode) !== -1)
     return "COMPLETION BLOCKED: Response claims completion, but this session has NO tool evidence.";
   if (!ledger || ledger.length === 0) return null;
+
+  // v1.4 #2: Dirty-file check — block if unverified files remain
+  if (state && hasDirtyFiles(state)) {
+    var dirty = Object.keys(state.dirtyFiles);
+    return "COMPLETION BLOCKED: " + dirty.length + " file(s) modified but not covered by a passing verification: " + dirty.join(", ").substring(0, 200) + ". Run a relevant check (test/lint/typecheck).";
+  }
 
   var lastWriteIdx = -1;
   for (var i = ledger.length - 1; i >= 0; i--)
@@ -699,9 +782,15 @@ var fablizePlugin = async function (_input) {
       if (sessionID) {
         var st = stateOf(sessionID);
         if (!st) return;
-        // v1.3: Don't reset to default on follow-up messages
-        if (mode !== "default") st.currentTaskMode = mode;
-        // ══ v1.2: Skip model settings in off/lite modes ══
+        // v1.4 #1: Task epoch — new task detection
+        if (mode !== "default" && mode !== st.currentTaskMode) {
+          // Mode changed → new task → reset epoch
+          resetTaskEpoch(st, sessionID);
+          st.currentTaskMode = mode;
+        } else if (mode !== "default") {
+          st.currentTaskMode = mode;
+        }
+        // v1.2: Skip model settings in off/lite modes
         if (st.fablizeMode === "off" || st.fablizeMode === "lite") {
           st.isRisky = st.isRisky || detectRisky(msgText);
           return;
@@ -767,7 +856,7 @@ var fablizePlugin = async function (_input) {
                 state.pendingCompletionBlock = "VERIFICATION RECOVERY REQUIRED: A check failed and must be fixed before completion.";
                 break;
               }
-              var liteBlock = checkCompletionGate(fullText, ledger, state.currentTaskMode);
+              var liteBlock = checkCompletionGate(fullText, ledger, state.currentTaskMode, state);
               if (liteBlock) state.pendingCompletionBlock = liteBlock;
             }
             break;
@@ -783,10 +872,12 @@ var fablizePlugin = async function (_input) {
             state.planProvided = true;
           }
 
-          // #4: DIFF-AWARE REVIEW — verify evidence before accepting review
+          // #4: DIFF-AWARE REVIEW — verify evidence before accepting review (v1.4: provenance check)
           if (state.reviewRequested && !state.reviewDone) {
             var hasVerdict = /no actionable finding|diff review|adversarial/i.test(fullText);
-            if (hasVerdict && !state.reviewEvidenceSeen) {
+            // v1.4 #4: Require diff evidence AFTER last write
+            var diffIsFresh = state.lastDiffTimestamp >= state.lastWriteTimestamp;
+            if (hasVerdict && (!state.reviewEvidenceSeen || !diffIsFresh)) {
               // Verdict without evidence → block
               state.pendingCompletionBlock = "DIFF REVIEW EVIDENCE REQUIRED: You stated a review verdict without inspecting the diff. Run `git diff --check` and `git diff`, then report findings with file/line evidence.";
               break;
@@ -802,11 +893,29 @@ var fablizePlugin = async function (_input) {
               state.pendingCompletionBlock = "VERIFICATION RECOVERY REQUIRED: A check failed and must be fixed before completion. Do not claim 'done'. Investigate the failure in the evidence ledger, form 2+ hypotheses, fix, and rerun the failing check.";
               break;
             }
+            // v1.4 #3: Block completion if blind-spot or plan was bypassed (unless waived)
+            if (!state.bypassWaiverAcknowledged) {
+              var hasWaiver = /acknowledge\s+(?:the\s+)?risk|accept\s+(?:the\s+)?risk|risk\s+accepted/i.test(fullText);
+              if (hasWaiver) {
+                state.bypassWaiverAcknowledged = true;
+              } else if (state.blindSpotBypassed) {
+                state.pendingCompletionBlock = "BLIND-SPOT BYPASS: You skipped the blind-spot pass before editing risky code. Either complete the blind-spot pass now, or explicitly acknowledge the risk to proceed.";
+                break;
+              } else if (state.planBypassed) {
+                state.pendingCompletionBlock = "PLAN BYPASS: You started editing without stating the implementation contract (Goal/Scope/Acceptance). State the plan briefly, or acknowledge the risk to proceed.";
+                break;
+              }
+            }
             var writeInfo = countWritesInLedger(ledger);
             var needsReview = (writeInfo.unique >= 3 || hasRiskyFileChange(ledger)) && !state.reviewRequested;
+            // v1.4 #4: Diff review provenance — require diff AFTER last write
             if (needsReview) {
               state.reviewRequested = true;
-              state.pendingCompletionBlock = DIFF_REVIEW_PROMPT + "\n\nFirst run `git diff` or `git diff --check` and inspect the output. Do NOT state the review verdict without tool evidence.";
+              var provenanceMsg = "";
+              if (state.lastWriteTimestamp > 0 && state.lastDiffTimestamp < state.lastWriteTimestamp) {
+                provenanceMsg = " NOTE: Previous git diff is stale (before latest write). Re-run `git diff` after your changes.";
+              }
+              state.pendingCompletionBlock = DIFF_REVIEW_PROMPT + "\n\nFirst run `git diff --check` and `git diff`, inspect the output." + provenanceMsg + " Do NOT state the review verdict without tool evidence.";
               break;
             }
             // If review was requested but not done yet → block
@@ -817,7 +926,7 @@ var fablizePlugin = async function (_input) {
           }
 
           // Normal completion gate
-          var completionBlock = checkCompletionGate(fullText, ledger, state.currentTaskMode);
+          var completionBlock = checkCompletionGate(fullText, ledger, state.currentTaskMode, state);
           if (completionBlock) {
             state.pendingCompletionBlock = completionBlock;
           } else if (!hasToolCall) {
@@ -856,10 +965,13 @@ var fablizePlugin = async function (_input) {
 
       // ══ v1.2: LITE mode — evidence + recovery only, skip blind-spot/plan/journal ══
       if (state.fablizeMode === "lite") {
-        // Track written files (needed for completion gate)
+        // Track written files + dirty files (v1.4 #2)
         if ((input.tool === "write" || input.tool === "edit") && filePath) {
           if (state.writtenFiles.indexOf(filePath) === -1) state.writtenFiles.push(filePath);
           state.hasWritesSinceLastVerify = true;
+          var ext = filePath.split(".").pop().toLowerCase();
+          state.dirtyFiles[filePath] = ext;
+          state.lastWriteTimestamp = Date.now();
         }
         // Recovery tracking — v1.3: match command identity
         if (input.tool === "bash" && isVerificationCommand(command)) {
@@ -883,6 +995,10 @@ var fablizePlugin = async function (_input) {
             }
           }
         }
+        // v1.4 #2: Clear dirty files covered by successful verification
+        if (input.tool === "bash" && exitCode === 0 && !errorFlag && isVerificationCommand(command)) {
+          clearCoveredDirtyFiles(state, command);
+        }
         return;
       }
 
@@ -892,6 +1008,8 @@ var fablizePlugin = async function (_input) {
         if (!st) return;
         if (st.writtenFiles.indexOf(filePath) === -1) st.writtenFiles.push(filePath);
         st.hasWritesSinceLastVerify = true;
+        st.dirtyFiles[filePath] = filePath.split(".").pop().toLowerCase();
+        st.lastWriteTimestamp = Date.now();
         // If blind-spot was requested but not completed, mark as bypassed (not done)
         if (st.blindSpotRequested && !st.blindSpotDone) st.blindSpotBypassed = true;
         // If plan was requested but not provided, mark as bypassed
@@ -929,6 +1047,22 @@ var fablizePlugin = async function (_input) {
             vState.verificationFailureSummary = null;
             vState.verificationFailureAttempts = 0;
             vState.verificationFailedCommand = null;
+          }
+        }
+      }
+
+      // v1.4 #2: Clear dirty files covered by successful verification
+      if (input.tool === "bash" && exitCode === 0 && !errorFlag && isVerificationCommand(command)) {
+        var dState = stateOf(sessionID);
+        if (dState) clearCoveredDirtyFiles(dState, command);
+      }
+      // v1.4 #4: Track diff review provenance timestamps
+      if (input.tool === "bash" && exitCode === 0) {
+        var tsState = stateOf(sessionID);
+        if (tsState) {
+          if (isDiffReviewCommand(command)) {
+            tsState.lastDiffTimestamp = Date.now();
+            if (/--check/.test(command)) tsState.lastDiffCheckTimestamp = Date.now();
           }
         }
       }
