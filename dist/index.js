@@ -1010,6 +1010,12 @@ var fablizePlugin = async function (_input) {
         st.hasWritesSinceLastVerify = true;
         st.dirtyFiles[filePath] = filePath.split(".").pop().toLowerCase();
         st.lastWriteTimestamp = Date.now();
+        // v1.4 #4 fix: invalidate review if new writes happen after review was done
+        if (st.reviewDone) {
+          st.reviewDone = false;
+          st.reviewRequested = false;
+          st.reviewEvidenceSeen = false;
+        }
         // If blind-spot was requested but not completed, mark as bypassed (not done)
         if (st.blindSpotRequested && !st.blindSpotDone) st.blindSpotBypassed = true;
         // If plan was requested but not provided, mark as bypassed
