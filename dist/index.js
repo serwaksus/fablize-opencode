@@ -80,6 +80,15 @@ function setFablizeMode(state, sessionID, nextMode) {
   state.verificationFailureAttempts = 0;
   state.verificationFailedCommand = null;
   state.hasWritesSinceLastVerify = false;
+  state.blindSpotRequested = false;
+  state.blindSpotDone = false;
+  state.blindSpotBypassed = false;
+  state.planRequested = false;
+  state.planProvided = false;
+  state.planBypassed = false;
+  state.invariantsInjected = false;
+  state.isRisky = false;
+  state.writtenFiles = [];
 }
 
 // ══ TASK MODE DETECTION ══
@@ -676,10 +685,11 @@ var fablizePlugin = async function (_input) {
         var cmd = (fabCmd[1] || "status").toLowerCase();
         if (sessionID) {
           var fst = stateOf(sessionID);
+          if (!fst) return;
           if (cmd === "off") { setFablizeMode(fst, sessionID, "off"); fst.fablizeStatusRequested = true; }
           else if (cmd === "lite") { setFablizeMode(fst, sessionID, "lite"); fst.fablizeStatusRequested = true; }
           else if (cmd === "full") { setFablizeMode(fst, sessionID, "full"); fst.fablizeStatusRequested = true; }
-          else { fst.fablizeStatusRequested = true; } // status or unknown → show status
+          else { fst.fablizeStatusRequested = true; }
         }
         // Do NOT run task mode detection or change model settings for /fablize commands
         return;
@@ -858,7 +868,7 @@ var fablizePlugin = async function (_input) {
             if (state.verificationFailedCommand && state.verificationFailedCommand === normCmd && state.hasWritesSinceLastVerify) {
               state.verificationFailureAttempts++;
             } else {
-              state.verificationFailureAttempts = 1;
+              state.verificationFailureAttempts = 0;
             }
             state.verificationRecoveryRequired = true;
             state.verificationFailureSummary = extractFailureSummary(command, outStr, exitCode);
@@ -907,7 +917,7 @@ var fablizePlugin = async function (_input) {
           if (vState.verificationFailedCommand && vState.verificationFailedCommand === fullNormCmd && vState.hasWritesSinceLastVerify) {
             vState.verificationFailureAttempts++;
           } else {
-            vState.verificationFailureAttempts = 1;
+            vState.verificationFailureAttempts = 0;
           }
           vState.verificationRecoveryRequired = true;
           vState.verificationFailureSummary = extractFailureSummary(command, outStr, exitCode);
