@@ -66,11 +66,6 @@ function stateOf(sessionID) {
       lastDiffTimestamp: 0,
       // v1.4 #3: bypass waiver
       bypassWaiverAcknowledged: false,
-      // v1.5: completeness + broad-test
-      completenessCheckInjected: false,
-      broadTestRequested: false,
-      broadTestPending: false,
-      broadTestFailureAcknowledged: false,
     });
   }
   var state = sessionState.get(sessionID);
@@ -104,10 +99,6 @@ function setFablizeMode(state, sessionID, nextMode) {
   state.invariantsInjected = false;
   state.isRisky = false;
   state.writtenFiles = [];
-  state.completenessCheckInjected = false;
-  state.broadTestRequested = false;
-  state.broadTestPending = false;
-  state.broadTestFailureAcknowledged = false;
 }
 
 // ══ v1.4 #1: TASK EPOCH — reset gate state for a new user task ══
@@ -139,10 +130,6 @@ function resetTaskEpoch(state, sessionID) {
   state.lastWriteTimestamp = 0;
   state.lastDiffCheckTimestamp = 0;
   state.lastDiffTimestamp = 0;
-  state.completenessCheckInjected = false;
-  state.broadTestRequested = false;
-  state.broadTestPending = false;
-  state.broadTestFailureAcknowledged = false;
   // Clear ledger for this session
   if (sessionID) ledgers.set(sessionID, []);
 }
@@ -242,8 +229,7 @@ var PLAN_CONTRACT_PROMPT = [
   "Before editing files, state briefly:",
   "Goal: <one sentence>",
   "In scope: <files/areas>",
-  "Callers affected: <2+ files that import or use the code you plan to change>",
-  "Edge cases: <2+ scenarios: empty input, boundary values, concurrent access>",
+  "Out of scope: <what you will NOT touch>",
   "Acceptance checks: <how to verify success>",
   "Risks/rollback: <what could break, how to undo>",
   "Then proceed. If scope expands during work, state why explicitly."
@@ -273,35 +259,6 @@ var RECOVERY_PROMPT = [
   "If the issue remains after two genuine repair attempts,",
   "report UNRESOLVED with the blocker and evidence."
 ].join("\n");
-
-// ══ v1.5: COMPLETENESS PROMPT (advisory, .py only) ══
-var COMPLETENESS_PROMPT = [
-  "--- COMPLETENESS CHECK (advisory) ---",
-  "If your changes affect a class or protocol interface, verify related methods",
-  "are implemented for consistency (e.g., __repr__, __str__, __eq__, __iter__,",
-  "__next__, __getitem__, __len__, __contains__). Missing methods cause partial fixes."
-].join("\n");
-
-// ══ v1.5: BROAD-TEST PROMPT ══
-var BROAD_TEST_PROMPT = [
-  "--- BREADTH CHECK ---",
-  "Your targeted tests passed. Now run the FULL test module",
-  "(without -k or :: filter) to check for regressions.",
-  "If broader tests reveal pre-existing failures unrelated to your change,",
-  "state which ones are pre-existing and why."
-].join("\n");
-
-// ══ v1.5: DETECT TARGETED TEST COMMAND ══
-function isTargetedTest(command) {
-  var c = (command || "").toLowerCase();
-  // pytest -k or pytest :: (method/class targeting)
-  if (/pytest\b.*(-k\s|::)/i.test(c)) return true;
-  // jest -t
-  if (/jest\b.*-t\s/i.test(c)) return true;
-  // go test -run
-  if (/go\s+test\b.*-run\s/i.test(c)) return true;
-  return false;
-}
 
 // ══ CONDITIONAL DETECTION HELPERS ══
 function hasPlanMarkers(text) {
@@ -717,10 +674,6 @@ var fablizePlugin = async function (_input) {
           parts.push("\n--- " + state.pendingCompletionBlock + " ---\n");
           state.pendingCompletionBlock = null;
         }
-        // v1.5: Broad-test injection (lite includes broad-test)
-        if (state.broadTestRequested && state.broadTestPending) {
-          parts.push("\n" + BROAD_TEST_PROMPT);
-        }
         output.system.push(parts.join("\n"));
         return;
       }
@@ -795,20 +748,6 @@ var fablizePlugin = async function (_input) {
         if (state.verificationFailureSummary) {
           parts.push("\nLast failure: " + state.verificationFailureSummary);
         }
-      }
-
-      // ══ v1.5: COMPLETENESS PROMPT (advisory, .py only, once per task) ══
-      if (!state.completenessCheckInjected && state.writtenFiles.length > 0) {
-        var hasPyFile = state.writtenFiles.some(function(fp) { return /\.py$/i.test(fp); });
-        if (hasPyFile) {
-          state.completenessCheckInjected = true;
-          parts.push("\n" + COMPLETENESS_PROMPT);
-        }
-      }
-
-      // ══ v1.5: BROAD-TEST INJECTION ══
-      if (state.broadTestRequested && state.broadTestPending) {
-        parts.push("\n" + BROAD_TEST_PROMPT);
       }
 
       parts.push(getLedgerSummary(sessionID));
@@ -949,19 +888,6 @@ var fablizePlugin = async function (_input) {
           }
 
           if (DONE_PATTERNS.some(function(re) { return re.test(fullText); })) {
-            // v1.5: Broad-test escape hatch — if broad test failed, allow "pre-existing" claim
-            if (state.verificationRecoveryRequired && state.broadTestPending && !state.broadTestFailureAcknowledged) {
-              var preExistingClaim = /pre[- ]existing|unrelated to (?:my|this|the) change|not caused by/i.test(fullText);
-              if (preExistingClaim) {
-                state.broadTestFailureAcknowledged = true;
-                state.verificationRecoveryRequired = false;
-                state.verificationFailureSummary = null;
-                state.broadTestPending = false;
-              } else {
-                state.pendingCompletionBlock = "VERIFICATION RECOVERY (BROAD TEST): Broader tests failed. Determine if caused by your change or pre-existing. If pre-existing, state which failures and why they are unrelated.";
-                break;
-              }
-            }
             // ══ v1.1: Block completion if verification recovery is required ══
             if (state.verificationRecoveryRequired) {
               state.pendingCompletionBlock = "VERIFICATION RECOVERY REQUIRED: A check failed and must be fixed before completion. Do not claim 'done'. Investigate the failure in the evidence ledger, form 2+ hypotheses, fix, and rerun the failing check.";
@@ -1073,15 +999,6 @@ var fablizePlugin = async function (_input) {
         if (input.tool === "bash" && exitCode === 0 && !errorFlag && isVerificationCommand(command)) {
           clearCoveredDirtyFiles(state, command);
         }
-        // v1.5: Broad-test detection
-        if (input.tool === "bash" && exitCode === 0 && !errorFlag && isVerificationCommand(command)) {
-          if (isTargetedTest(command) && !state.broadTestRequested) {
-            state.broadTestRequested = true;
-            state.broadTestPending = true;
-          } else if (!isTargetedTest(command) && state.broadTestPending) {
-            state.broadTestPending = false;
-          }
-        }
         return;
       }
 
@@ -1155,20 +1072,7 @@ var fablizePlugin = async function (_input) {
           }
         }
       }
-
-      // ══ v1.5: BROAD-TEST DETECTION ══
-      if (input.tool === "bash" && exitCode === 0 && !errorFlag && isVerificationCommand(command)) {
-        var btState = stateOf(sessionID);
-        if (btState) {
-          if (isTargetedTest(command) && !btState.broadTestRequested) {
-            btState.broadTestRequested = true;
-            btState.broadTestPending = true;
-          } else if (!isTargetedTest(command) && btState.broadTestPending) {
-            btState.broadTestPending = false;
-          }
-        }
-      }
-     },
+    },
 
     // ══ #5: COMPACTION MEMORY — preserve fablize state across context compression ══
     "experimental.session.compacting": async function (input, output) {
