@@ -54,7 +54,7 @@ function stateOf(sessionID) {
       verificationFailedCommand: null,
       writtenFiles: [],
       hasWritesSinceLastVerify: false,
-      fablizeMode: "full",
+      fablizeMode: "lite",
       fablizeStatusRequested: false,
       // v1.4 #1: task epochs
       taskEpoch: 0,
